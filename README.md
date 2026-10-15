@@ -1,0 +1,116 @@
+# pixi-oci
+
+Build OCI container images from [pixi](https://pixi.sh) environments, without Docker, BuildKit or any other daemon.
+
+`pixi-oci` reads `pixi.toml` and `pixi.lock`, installs the locked conda packages of one environment into a prefix, slices that prefix into cacheable layers, stacks them on a base image pulled straight from a registry and writes an OCI image tarball. It runs anywhere `pixi` runs and builds `linux-64` or `linux-aarch64` images from macOS or Linux hosts alike.
+
+It replaces the usual multi-stage Dockerfile dance (`pixi install` → `pixi shell-hook` → `COPY --from=build`) with a single command and a few lines of configuration.
+
+## Usage
+
+```shell
+pixi-oci build                      # uses ./pixi.toml, writes <name>.tar
+pixi-oci build --manifest-path app  # manifest in another directory
+pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
+pixi-oci build --format oci-dir -o ./myapp   # OCI layout directory instead of a tarball
+```
+
+Because the binary is called `pixi-oci`, pixi picks it up as an extension: `pixi oci build` works too.
+
+The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
+
+```shell
+docker load -i myapp.tar
+podman load -i myapp.tar
+skopeo copy oci-archive:myapp.tar docker://ghcr.io/you/myapp:1.2.3
+skopeo inspect oci-archive:myapp.tar
+```
+
+## Configuration
+
+Everything lives in the `[tool.pixi-oci]` table of your `pixi.toml` (or `pyproject.toml`). Command line flags override the corresponding keys.
+
+```toml
+[workspace]
+name = "example-project"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+caddy = "*"
+
+[tool.pixi-oci]
+base-image = "ubuntu"            # any registry reference, or "scratch" (the default)
+environment = "default"          # pixi environment to install
+install-prefix = "/opt/env"      # where the environment lives inside the image
+name = "example-project"         # image name, defaults to the workspace name
+tag = "latest"
+max-layers = 20                  # how many layers the conda packages may use
+copy-to-image = [
+  "my-file",                                                  # -> <working-dir>/my-file
+  { source = "my-file2", destination = "/my-file-renamed" },  # explicit destination
+]
+
+[tool.pixi-oci.oci-config]
+# https://github.com/moby/docker-image-spec/blob/v1.3.1/spec.md#image-json-field-descriptions
+entrypoint = "caddy file-server --browse --root ."   # string (shell-split) or list
+cmd = ["--listen", ":8080"]
+env = { FOO = "bar" }                                # table or ["FOO=bar"] list
+working-dir = "/app"
+user = "1000:1000"
+labels = { "org.opencontainers.image.source" = "https://github.com/you/example" }
+exposed-ports = [8080, "9090/udp"]
+volumes = ["/data"]
+stop-signal = "SIGTERM"
+```
+
+| key | default | description |
+| --- | --- | --- |
+| `base-image` | `scratch` | Base image reference such as `ubuntu`, `debian:bookworm-slim` or `ghcr.io/org/image:tag`. Credentials are read from `~/.docker/config.json`, including credential helpers. |
+| `environment` | `default` | The pixi environment to put into the image. |
+| `platform` | see below | Conda platform to build for. Only linux platforms are supported. |
+| `install-prefix` | `/opt/env` | Absolute path of the environment inside the image. |
+| `name` | workspace name | Image repository name. |
+| `tag` | `latest` | Image tag. |
+| `max-layers` | `20` | Upper bound for the number of layers used by the conda packages. |
+| `copy-to-image` | `[]` | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile. |
+| `activation-shell` | `/bin/bash` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts). |
+| `oci-config.*` | | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`). The PascalCase spec names are accepted too. |
+
+### Platform selection
+
+The platform comes from `--platform`, then `platform` in the config, then the current machine if it runs linux, then the single linux platform of the environment. With several linux platforms in the lockfile you have to pick one explicitly. Each invocation builds one platform; `linux-64` becomes `linux/amd64`, `linux-aarch64` becomes `linux/arm64/v8`.
+
+### Environment activation
+
+The image config carries everything `pixi shell-hook` would export: `PATH` with `<install-prefix>/bin` in front, `CONDA_PREFIX`, variables from the packages' `etc/conda/env_vars.d`, your `[activation.env]` tables and `oci-config.env`. Containers therefore start with an activated environment, even for `scratch` images without a shell.
+
+When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a tiny wrapper to `<install-prefix>/etc/pixi-oci/entrypoint.sh` that sources them and then `exec`s your entrypoint. The wrapper is prepended to the entrypoint automatically and needs `activation-shell` to exist in the base image.
+
+`[activation.scripts]` from the manifest are not run; a warning is printed if the environment defines any.
+
+### Layers
+
+Layers are cheap to cache but every layer has a cost, so `max-layers` bounds how many `pixi-oci` creates for the packages. Packages are sorted by how many other packages depend on them; the most depended-on packages get their own layers at the bottom (they change least often), and whatever does not fit shares the last package layer. Files copied with `copy-to-image` form one more layer on top. Set `max-layers = 1` for a single environment layer.
+
+All layers are reproducible: entries are sorted, owned by root, and carry a fixed modification time (`SOURCE_DATE_EPOCH` if set, else 0). Set `SOURCE_DATE_EPOCH` to also pin the image creation timestamp; two builds of the same lockfile then produce byte-identical tarballs.
+
+### Caching
+
+Conda packages go into the regular rattler package cache, base image layers into `<cache>/pixi-oci/base-images`. Override the root with `--cache-dir` or `PIXI_OCI_CACHE_DIR`. Mirrors and channel authentication are read from the usual rattler/pixi sources; pass `--config` to use a pixi config file with `mirrors` settings.
+
+## Limitations
+
+- PyPI dependencies in the lockfile are rejected. Use conda packages for now.
+- Source packages (pixi-build) are not supported.
+- One platform per build; there is no multi-arch index yet.
+- `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.
+
+## Development
+
+```shell
+pixi run build
+pixi run test            # needs network: downloads caddy and ubuntu
+pixi run -e lint pre-commit-run
+pixi run example         # builds example/ into example-project.tar
+```

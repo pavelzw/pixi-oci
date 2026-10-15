@@ -2,5 +2,69 @@
 name = "pixi-oci"
 version = "0.1.0"
 edition = "2024"
+description = "Build OCI images from pixi environments without a container daemon"
+license = "BSD-3-Clause"
+repository = "https://github.com/pavelzw/pixi-oci"
+
+[features]
+default = ["rustls"]
+rustls = [
+  "reqwest/rustls",
+  "rattler/rustls",
+  "rattler_networking/rustls",
+  "rattler_cache/rustls",
+  "oci-client/rustls-tls",
+]
+native-tls = [
+  "reqwest/native-tls",
+  "rattler/native-tls",
+  "rattler_networking/native-tls",
+  "rattler_cache/native-tls",
+  "oci-client/native-tls",
+]
 
 [dependencies]
+anyhow = "1.0"
+canon-json = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6", features = ["derive", "string", "env"] }
+clap-verbosity-flag = { version = "3.0", features = ["tracing"] }
+clap_complete = "4.6"
+docker_credential = "1.4"
+flate2 = "1.1"
+futures = "0.3"
+indicatif = "0.18"
+oci-client = { version = "0.18", default-features = false }
+oci-spec = "0.10"
+ocidir = "0.8"
+rattler = { version = "0.54.1", default-features = false, features = ["indicatif"] }
+rattler_cache = { version = "0.10.19", default-features = false }
+rattler_conda_types = "0.57.0"
+rattler_config = "0.9.3"
+rattler_lock = "0.34.7"
+rattler_networking = { version = "0.34.1", default-features = false, features = ["dirs", "rattler_config"] }
+rattler_shell = "0.29.4"
+reqwest = { version = "0.13", default-features = false, features = ["http2"] }
+reqwest-middleware = { package = "astral-reqwest-middleware", version = "0.5" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+shlex = "2.0"
+tar = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+walkdir = "2.5"
+
+[dev-dependencies]
+assert_cmd = "2.2"
+rstest = "0.27"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+opt-level = "z"

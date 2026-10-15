@@ -1,0 +1,255 @@
+//! Pulling the base image from a registry into a local OCI layout cache.
+
+use std::{io::Write, str::FromStr};
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use oci_client::{
+    Client, Reference,
+    client::ClientConfig,
+    manifest::{ImageIndexEntry, OciDescriptor},
+    secrets::RegistryAuth,
+};
+use oci_spec::image::{
+    Arch, Descriptor, DescriptorBuilder, Digest, ImageConfiguration, MediaType, Os,
+};
+use ocidir::{OciDir, OciRead};
+
+use crate::config::SCRATCH;
+
+/// A base image whose layers are available in the cache directory.
+#[derive(Debug)]
+pub struct BaseImage {
+    pub reference: Reference,
+    /// Layer descriptors with OCI media types, in order.
+    pub layers: Vec<Descriptor>,
+    pub config: ImageConfiguration,
+}
+
+/// The target platform of the image.
+#[derive(Debug, Clone)]
+pub struct TargetPlatform {
+    pub arch: Arch,
+    pub variant: Option<String>,
+}
+
+impl TargetPlatform {
+    pub fn to_oci_platform(&self) -> Result<oci_spec::image::Platform> {
+        let mut builder = oci_spec::image::PlatformBuilder::default()
+            .os(Os::Linux)
+            .architecture(self.arch.clone());
+        if let Some(variant) = &self.variant {
+            builder = builder.variant(variant.clone());
+        }
+        Ok(builder.build()?)
+    }
+
+    fn matches(&self, entry: &ImageIndexEntry, require_variant: bool) -> bool {
+        entry.platform.as_ref().is_some_and(|p| {
+            p.os == Os::Linux
+                && p.architecture == self.arch
+                && (!require_variant || p.variant == self.variant)
+        })
+    }
+}
+
+/// Resolve credentials for a registry from `~/.docker/config.json` (including credential
+/// helpers). Falls back to anonymous access.
+pub fn registry_auth(reference: &Reference) -> RegistryAuth {
+    let registry = reference.registry();
+    let candidates: Vec<String> = if registry == "docker.io" || registry == "index.docker.io" {
+        vec![
+            "https://index.docker.io/v1/".to_string(),
+            "index.docker.io".to_string(),
+            "docker.io".to_string(),
+        ]
+    } else {
+        vec![registry.to_string()]
+    };
+    for server in candidates {
+        match docker_credential::get_credential(&server) {
+            Ok(docker_credential::DockerCredential::UsernamePassword(user, pass)) => {
+                tracing::debug!("using docker credentials for {server}");
+                return RegistryAuth::Basic(user, pass);
+            }
+            Ok(docker_credential::DockerCredential::IdentityToken(token)) => {
+                tracing::debug!("using docker identity token for {server}");
+                return RegistryAuth::Bearer(token);
+            }
+            Err(e) => tracing::trace!("no docker credential for {server}: {e}"),
+        }
+    }
+    RegistryAuth::Anonymous
+}
+
+/// Map registry media types (docker or OCI) to the OCI media types used in the layout.
+pub fn layer_media_type(media_type: &str) -> Result<MediaType> {
+    Ok(match media_type {
+        "application/vnd.docker.image.rootfs.diff.tar" => MediaType::ImageLayer,
+        "application/vnd.docker.image.rootfs.diff.tar.gzip"
+        | "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip" => MediaType::ImageLayerGzip,
+        other => match MediaType::from(other) {
+            MediaType::ImageLayer
+            | MediaType::ImageLayerGzip
+            | MediaType::ImageLayerZstd
+            | MediaType::ImageLayerNonDistributable
+            | MediaType::ImageLayerNonDistributableGzip
+            | MediaType::ImageLayerNonDistributableZstd => MediaType::from(other),
+            _ => bail!("unsupported layer media type `{other}`"),
+        },
+    })
+}
+
+fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
+    let digest = Digest::from_str(&layer.digest)
+        .with_context(|| format!("invalid layer digest {}", layer.digest))?;
+    let size = u64::try_from(layer.size).context("negative layer size")?;
+    Ok(DescriptorBuilder::default()
+        .media_type(layer_media_type(&layer.media_type)?)
+        .digest(digest)
+        .size(size)
+        .build()?)
+}
+
+/// Pull the manifest, config and layers of `image` for `platform` into `cache`.
+/// Returns `None` for `scratch`.
+pub async fn fetch_base_image(
+    image: &str,
+    platform: &TargetPlatform,
+    cache: &OciDir,
+) -> Result<Option<BaseImage>> {
+    if image == SCRATCH {
+        return Ok(None);
+    }
+    let reference: Reference = image
+        .parse()
+        .with_context(|| format!("invalid base image reference `{image}`"))?;
+    let auth = registry_auth(&reference);
+
+    let resolver_platform = platform.clone();
+    let client = Client::new(ClientConfig {
+        platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
+            entries
+                .iter()
+                .find(|e| resolver_platform.matches(e, true))
+                .or_else(|| entries.iter().find(|e| resolver_platform.matches(e, false)))
+                .map(|e| e.digest.clone())
+        })),
+        ..Default::default()
+    });
+
+    eprintln!(
+        "⬇️  Pulling base image {} ({}/{}{})",
+        reference.whole(),
+        Os::Linux,
+        platform.arch,
+        platform
+            .variant
+            .as_deref()
+            .map(|v| format!("/{v}"))
+            .unwrap_or_default()
+    );
+    let (manifest, _digest, config_json) = client
+        .pull_manifest_and_config(&reference, &auth)
+        .await
+        .with_context(|| {
+            format!(
+                "could not pull base image {} for linux/{}",
+                reference.whole(),
+                platform.arch
+            )
+        })?;
+    let config = ImageConfiguration::from_reader(config_json.as_bytes())
+        .context("could not parse the base image config")?;
+    if config.os() != &Os::Linux || config.architecture() != &platform.arch {
+        bail!(
+            "base image {} is {}/{} but the build targets linux/{}",
+            reference.whole(),
+            config.os(),
+            config.architecture(),
+            platform.arch
+        );
+    }
+
+    let mut layers = Vec::with_capacity(manifest.layers.len());
+    for layer in &manifest.layers {
+        let descriptor = to_oci_descriptor(layer)?;
+        if cache.has_blob(&descriptor)? {
+            tracing::debug!("base layer {} already cached", layer.digest);
+        } else {
+            download_blob(&client, &reference, layer, &descriptor, cache).await?;
+        }
+        layers.push(descriptor);
+    }
+
+    Ok(Some(BaseImage {
+        reference,
+        layers,
+        config,
+    }))
+}
+
+async fn download_blob(
+    client: &Client,
+    reference: &Reference,
+    layer: &OciDescriptor,
+    descriptor: &Descriptor,
+    cache: &OciDir,
+) -> Result<()> {
+    let mut stream = client
+        .pull_blob_stream(reference, layer)
+        .await
+        .with_context(|| format!("could not download layer {}", layer.digest))?;
+    let progress = indicatif::ProgressBar::new(stream.content_length.unwrap_or(descriptor.size()));
+    progress.set_style(
+        indicatif::ProgressStyle::with_template(
+            "  {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+        )
+        .expect("valid template")
+        .progress_chars("=> "),
+    );
+    progress.set_message(short_digest(&layer.digest));
+
+    let mut writer = cache.create_blob()?;
+    while let Some(chunk) = stream.stream.next().await {
+        let chunk = chunk.with_context(|| format!("error while downloading {}", layer.digest))?;
+        writer.write_all(&chunk)?;
+        progress.inc(chunk.len() as u64);
+    }
+    writer
+        .complete_verified_as(descriptor)
+        .map_err(|e| anyhow!("layer {} failed verification: {e}", layer.digest))?;
+    progress.finish_and_clear();
+    Ok(())
+}
+
+fn short_digest(digest: &str) -> String {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    hex.chars().take(12).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_docker_layer_types_to_oci() {
+        assert_eq!(
+            layer_media_type("application/vnd.docker.image.rootfs.diff.tar.gzip").unwrap(),
+            MediaType::ImageLayerGzip
+        );
+        assert_eq!(
+            layer_media_type("application/vnd.oci.image.layer.v1.tar+zstd").unwrap(),
+            MediaType::ImageLayerZstd
+        );
+        assert!(layer_media_type("application/vnd.oci.image.config.v1+json").is_err());
+    }
+
+    #[test]
+    fn normalizes_references() {
+        let r: Reference = "ubuntu".parse().unwrap();
+        assert_eq!(r.whole(), "docker.io/library/ubuntu:latest");
+        let r: Reference = "ghcr.io/prefix-dev/pixi:0.40.0".parse().unwrap();
+        assert_eq!(r.whole(), "ghcr.io/prefix-dev/pixi:0.40.0");
+    }
+}

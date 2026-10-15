@@ -1,0 +1,32 @@
+[workspace]
+name = "pixi-oci"
+channels = ["conda-forge"]
+exclude-newer = "7d"
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[tasks]
+build = "cargo build --release"
+test = "cargo test"
+example = "cargo run -- build --manifest-path example"
+
+[dependencies]
+rust = "==1.98.1"
+openssl = "3.*"
+pkg-config = "*"
+
+[target.linux.dependencies]
+compilers = ">=1.7.0"
+
+[feature.lint.dependencies]
+pre-commit = "*"
+prettier = "*"
+taplo = "*"
+pre-commit-hooks = "*"
+typos = "*"
+shellcheck = "*"
+[feature.lint.tasks]
+pre-commit-install = "pre-commit install"
+pre-commit-run = "pre-commit run -a"
+
+[environments]
+lint = { features = ["lint"], no-default-feature = true }
