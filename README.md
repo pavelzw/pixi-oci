@@ -40,7 +40,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 caddy = "*"
 
 [tool.pixi-oci]
-base-image = "ubuntu"            # any registry reference, or "scratch" (the default)
+base = { shadow-setup = true, glibc = "2.41-12+deb13u4" }   # or a registry image, see below
 environment = "default"          # pixi environment to install
 install-prefix = "/opt/env"      # where the environment lives inside the image
 name = "example-project"         # image name, defaults to the workspace name
@@ -66,7 +66,7 @@ stop-signal = "SIGTERM"
 
 | key | default | description |
 | --- | --- | --- |
-| `base-image` | `scratch` | Base image reference such as `ubuntu`, `debian:bookworm-slim` or `ghcr.io/org/image:tag`. Credentials are read from `~/.docker/config.json`, including credential helpers. |
+| `base` | `{}` | A registry image to build on, or a minimal root filesystem built from scratch. See [Base](#base). |
 | `environment` | `default` | The pixi environment to put into the image. |
 | `platform` | see below | Conda platform to build for. Only linux platforms are supported. |
 | `install-prefix` | `/opt/env` | Absolute path of the environment inside the image. |
@@ -77,6 +77,29 @@ stop-signal = "SIGTERM"
 | `activation-shell` | `/bin/bash` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts). |
 | `oci-config.*` | | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`). The PascalCase spec names are accepted too. |
 
+### Base
+
+`base` is either a registry reference or a table describing a root filesystem built from scratch:
+
+```toml
+# a registry image; credentials come from ~/.docker/config.json, including credential helpers
+base = "ubuntu:latest"
+
+# from scratch, with glibc and a shadow setup (the default, same as `base = {}`)
+base = { shadow-setup = true, glibc = true }
+
+# from scratch, pinning the glibc version
+base = { glibc = "2.41-12+deb13u4" }
+
+# a completely empty root filesystem (same as `base = "scratch"`)
+base = { shadow-setup = false, glibc = false }
+```
+
+- `glibc` adds Debian's `libc6` package, downloaded from [snapshot.debian.org](https://snapshot.debian.org/binary/libc6/) and verified against the archive's checksum. `true` means `2.41-12+deb13u4` (Debian 13); a string is any Debian `libc6` version. The layer has the libraries, the dynamic loader reachable as `/lib64/ld-linux-x86-64.so.2` (or the platform's equivalent), `/etc/nsswitch.conf` and the copyright file. The iconv `gconv` modules are left out. The build fails if a locked package needs a newer glibc (`__glibc >=...`) than the chosen version.
+- `shadow-setup` adds `/etc/passwd`, `/etc/group`, `/etc/shadow` and `/etc/gshadow` with `root` and `nobody`, plus `/root` and a world-writable `/tmp`, like [`shadowSetup`](https://nixos.org/manual/nixpkgs/stable/#ssec-pkgs-dockerTools-shadowSetup) in nixpkgs.
+
+`--base-image` on the command line overrides `base` with a registry reference (or `scratch`).
+
 ### Platform selection
 
 The platform comes from `--platform`, then `platform` in the config, then the current machine if it runs linux, then the single linux platform of the environment. With several linux platforms in the lockfile you have to pick one explicitly. Each invocation builds one platform; `linux-64` becomes `linux/amd64`, `linux-aarch64` becomes `linux/arm64/v8`.
@@ -85,7 +108,7 @@ The platform comes from `--platform`, then `platform` in the config, then the cu
 
 The image config carries everything `pixi shell-hook` would export: `PATH` with `<install-prefix>/bin` in front, `CONDA_PREFIX`, variables from the packages' `etc/conda/env_vars.d`, your `[activation.env]` tables and `oci-config.env`. Containers therefore start with an activated environment, even for `scratch` images without a shell.
 
-When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a tiny wrapper to `<install-prefix>/etc/pixi-oci/entrypoint.sh` that sources them and then `exec`s your entrypoint. The wrapper is prepended to the entrypoint automatically and needs `activation-shell` to exist in the base image.
+When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a tiny wrapper to `<install-prefix>/etc/pixi-oci/entrypoint.sh` that sources them and then `exec`s your entrypoint. The wrapper is prepended to the entrypoint automatically and needs `activation-shell` to exist in the image: a scratch base has no shell, so add `bash` to the environment and point `activation-shell` at `<install-prefix>/bin/bash`.
 
 `[activation.scripts]` from the manifest are not run; a warning is printed if the environment defines any.
 
@@ -97,7 +120,7 @@ All layers are reproducible: entries are sorted, owned by root, and carry a fixe
 
 ### Caching
 
-Conda packages go into the regular rattler package cache, base image layers into `<cache>/pixi-oci/base-images`. Override the root with `--cache-dir` or `PIXI_OCI_CACHE_DIR`. Mirrors and channel authentication are read from the usual rattler/pixi sources; pass `--config` to use a pixi config file with `mirrors` settings.
+Conda packages go into the regular rattler package cache, base image layers into `<cache>/pixi-oci/base-images` and Debian packages into `<cache>/pixi-oci/debian`. Override the root with `--cache-dir` or `PIXI_OCI_CACHE_DIR`. Mirrors and channel authentication are read from the usual rattler/pixi sources; pass `--config` to use a pixi config file with `mirrors` settings.
 
 ## Limitations
 
@@ -110,7 +133,7 @@ Conda packages go into the regular rattler package cache, base image layers into
 
 ```shell
 pixi run build
-pixi run test            # needs network: downloads caddy and ubuntu
+pixi run test            # needs network: downloads the example packages, ubuntu and libc6
 pixi run -e lint pre-commit-run
 pixi run example         # builds example/ into example-project.tar
 ```

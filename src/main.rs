@@ -53,7 +53,7 @@ struct BuildArgs {
     #[arg(short, long)]
     tag: Option<String>,
 
-    /// Base image reference, or `scratch`; overrides `base-image` from the config.
+    /// Base image reference, or `scratch` for an empty root filesystem; overrides `base`.
     #[arg(long)]
     base_image: Option<String>,
 

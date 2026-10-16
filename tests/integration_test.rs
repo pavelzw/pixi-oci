@@ -220,10 +220,12 @@ async fn build_example(
 #[tokio::test]
 async fn builds_example_on_ubuntu(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("example.tar");
-    let report = build_example(&out, "linux-64", None, OutputFormat::OciTar).await;
+    let report = build_example(&out, "linux-64", Some("ubuntu"), OutputFormat::OciTar).await;
     assert_eq!(report.reference, "example-project:latest");
-    assert_eq!(report.packages, 1);
-    assert_eq!(report.package_layers, 1);
+    assert_eq!(report.rootfs_layers, 0);
+    // More packages than `max-layers = 20`, so the last package layer is shared.
+    assert!(report.packages > 20);
+    assert_eq!(report.package_layers, 20);
     assert!(report.copy_layer);
     assert!(report.base_layers >= 1);
 
@@ -283,10 +285,14 @@ async fn builds_example_on_ubuntu(tmpdir: tempfile::TempDir) {
         .filter_map(|h| h.created_by.clone())
         .collect();
     assert_eq!(last_history[0], "pixi-oci: copy-to-image");
-    assert_eq!(last_history[1], "pixi-oci: caddy-2.11.7-hfc2019e_0");
+    assert!(
+        last_history[1].contains("packages (") && last_history[1].contains("caddy"),
+        "{}",
+        last_history[1]
+    );
 
-    // The package layer carries caddy, conda-meta and no host artefacts.
-    let package_layer = &manifest.layers[report.base_layers];
+    // The shared last package layer carries caddy, conda-meta and no host artefacts.
+    let package_layer = &manifest.layers[manifest.layers.len() - 2];
     let entries = archive.layer_entries(package_layer);
     let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
     assert!(names.contains(&"opt/env/bin/caddy"), "{names:?}");
@@ -337,6 +343,56 @@ async fn builds_example_on_ubuntu(tmpdir: tempfile::TempDir) {
 
 #[rstest]
 #[tokio::test]
+async fn builds_glibc_rootfs_from_scratch(tmpdir: tempfile::TempDir) {
+    // The example's `base` is a scratch table with glibc and the shadow setup.
+    let out = tmpdir.path().join("example.tar");
+    let report = build_example(&out, "linux-64", None, OutputFormat::OciTar).await;
+    assert_eq!(report.base_layers, 0);
+    assert_eq!(report.rootfs_layers, 2);
+
+    let archive = Archive::open(&out);
+    archive.verify_digests();
+    let manifest = archive.manifest();
+    assert_eq!(manifest.layers.len(), 2 + report.package_layers + 1);
+    let history: Vec<_> = archive
+        .config()
+        .history
+        .into_iter()
+        .filter_map(|h| h.created_by)
+        .collect();
+    assert_eq!(history[0], "pixi-oci: glibc 2.41-12+deb13u4 (debian libc6)");
+    assert_eq!(history[1], "pixi-oci: shadow setup");
+
+    let glibc: HashMap<String, tar::Header> = archive
+        .layer_entries(&manifest.layers[0])
+        .into_iter()
+        .map(|(n, h, _)| (n, h))
+        .collect();
+    assert!(glibc.contains_key("usr/lib/x86_64-linux-gnu/libc.so.6"));
+    assert!(glibc.contains_key("usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"));
+    assert!(glibc.contains_key("usr/share/doc/libc6/copyright"));
+    assert!(glibc.contains_key("etc/nsswitch.conf"));
+    assert!(!glibc.keys().any(|n| n.contains("/gconv/")));
+    let lib64 = &glibc["lib64"];
+    assert_eq!(lib64.entry_type(), tar::EntryType::Symlink);
+    assert_eq!(
+        lib64.link_name().unwrap().unwrap().to_str(),
+        Some("usr/lib64")
+    );
+
+    let shadow: HashMap<String, (tar::Header, Vec<u8>)> = archive
+        .layer_entries(&manifest.layers[1])
+        .into_iter()
+        .map(|(n, h, d)| (n, (h, d)))
+        .collect();
+    assert!(String::from_utf8_lossy(&shadow["etc/passwd"].1).starts_with("root:x:0:0:"));
+    assert!(shadow.contains_key("etc/group"));
+    assert_eq!(shadow["tmp/"].0.mode().unwrap(), 0o1777);
+    assert_eq!(shadow["root/"].0.mode().unwrap(), 0o700);
+}
+
+#[rstest]
+#[tokio::test]
 async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("layout");
     let report = build_example(&out, "linux-aarch64", Some("scratch"), OutputFormat::OciDir).await;
@@ -357,12 +413,13 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
         .unwrap()
     };
     let manifest: Manifest = serde_json::from_slice(&blob(&desc.digest)).unwrap();
-    assert_eq!(manifest.layers.len(), 2);
+    let layers = report.package_layers + 1;
+    assert_eq!(manifest.layers.len(), layers);
     let config: ImageConfig = serde_json::from_slice(&blob(&manifest.config.digest)).unwrap();
     assert_eq!(config.architecture, "arm64");
     assert_eq!(config.variant.as_deref(), Some("v8"));
-    assert_eq!(config.rootfs.diff_ids.len(), 2);
-    assert_eq!(config.history.len(), 2);
+    assert_eq!(config.rootfs.diff_ids.len(), layers);
+    assert_eq!(config.history.len(), layers);
     // No base image: PATH falls back to the default search path.
     assert_eq!(
         config.config.env[0],
@@ -464,6 +521,30 @@ async fn docker_can_load_and_run(tmpdir: tempfile::TempDir) {
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(String::from_utf8_lossy(&run.stdout).contains("2.11.7"));
+
+    // The Debian dynamic loader is reachable through the /lib64 (/lib) symlink and runs.
+    let loader = match subdir {
+        "linux-aarch64" => "/lib/ld-linux-aarch64.so.1",
+        _ => "/lib64/ld-linux-x86-64.so.2",
+    };
+    let run = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            oci_platform,
+            "--entrypoint",
+            loader,
+        ])
+        .args(["example-project:latest", "--version"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "running the loader failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("2.41"));
 }
 
 #[rstest]

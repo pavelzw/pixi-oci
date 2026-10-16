@@ -20,6 +20,8 @@ pub const DEFAULT_MAX_LAYERS: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 pub const DEFAULT_ACTIVATION_SHELL: &str = "/bin/bash";
 /// Pseudo base image meaning "start from an empty root filesystem".
 pub const SCRATCH: &str = "scratch";
+/// Debian `libc6` version used for `glibc = true`: the glibc of the current Debian stable.
+pub const DEFAULT_GLIBC_DEBIAN_VERSION: &str = "2.41-12+deb13u4";
 
 /// The parts of a pixi manifest that pixi-oci cares about. Everything else is ignored.
 #[derive(Deserialize, Debug, Default, Clone)]
@@ -106,8 +108,8 @@ pub struct ToolSection {
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PixiOciConfig {
-    /// Registry reference of the base image, or `scratch`.
-    pub base_image: Option<String>,
+    /// A registry image to build on, or a root filesystem built from scratch.
+    pub base: Option<BaseSpec>,
     /// The pixi environment to install.
     pub environment: Option<String>,
     /// The conda platform (subdir) to build for.
@@ -128,6 +130,71 @@ pub struct PixiOciConfig {
     /// Image config fields (docker image spec `config`).
     #[serde(default)]
     pub oci_config: OciConfigSection,
+}
+
+/// `base`: either a registry reference such as `"ubuntu:latest"` (or `"scratch"` for an empty
+/// root filesystem), or a table describing a minimal root filesystem built from scratch.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BaseSpec {
+    Image(String),
+    Scratch(ScratchBase),
+}
+
+impl Default for BaseSpec {
+    fn default() -> Self {
+        BaseSpec::Scratch(ScratchBase::default())
+    }
+}
+
+/// A root filesystem built from scratch.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ScratchBase {
+    /// Add `/etc/passwd`, `/etc/group`, their shadow files, `/root` and `/tmp`.
+    #[serde(default = "default_true")]
+    pub shadow_setup: bool,
+    /// Add glibc from Debian's `libc6` package.
+    #[serde(default)]
+    pub glibc: GlibcSpec,
+}
+
+impl Default for ScratchBase {
+    fn default() -> Self {
+        Self {
+            shadow_setup: true,
+            glibc: GlibcSpec::default(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `glibc = true` (default version), `false` (none) or a Debian `libc6` version.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum GlibcSpec {
+    Enabled(bool),
+    DebianVersion(String),
+}
+
+impl Default for GlibcSpec {
+    fn default() -> Self {
+        GlibcSpec::Enabled(true)
+    }
+}
+
+impl GlibcSpec {
+    /// The Debian `libc6` version to install, if any.
+    pub fn debian_version(&self) -> Option<&str> {
+        match self {
+            GlibcSpec::Enabled(true) => Some(DEFAULT_GLIBC_DEBIAN_VERSION),
+            GlibcSpec::Enabled(false) => None,
+            GlibcSpec::DebianVersion(version) => Some(version),
+        }
+    }
 }
 
 /// A file or directory to copy into the image.
@@ -464,7 +531,13 @@ mod tests {
     fn parses_example_manifest() {
         let m = parse(include_str!("../example/pixi.toml"));
         let cfg = m.tool.pixi_oci;
-        assert_eq!(cfg.base_image.as_deref(), Some("ubuntu"));
+        assert_eq!(
+            cfg.base,
+            Some(BaseSpec::Scratch(ScratchBase {
+                shadow_setup: true,
+                glibc: GlibcSpec::DebianVersion("2.41-12+deb13u4".into()),
+            }))
+        );
         assert_eq!(cfg.max_layers, NonZeroUsize::new(20));
         assert_eq!(cfg.copy_to_image.len(), 2);
         assert_eq!(
@@ -532,6 +605,34 @@ exposed-ports = [8080]
         );
         assert!(config.labels().is_none());
         assert!(config.volumes().is_none());
+    }
+
+    #[test]
+    fn parses_base_variants() {
+        let base = |toml: &str| parse(toml).tool.pixi_oci.base;
+        assert_eq!(
+            base("[tool.pixi-oci]\nbase = \"ubuntu:latest\"\n"),
+            Some(BaseSpec::Image("ubuntu:latest".into()))
+        );
+        let scratch = base("[tool.pixi-oci]\nbase = {}\n").unwrap();
+        assert_eq!(scratch, BaseSpec::default());
+        let BaseSpec::Scratch(scratch) = scratch else {
+            panic!("expected a scratch base");
+        };
+        assert_eq!(
+            scratch.glibc.debian_version(),
+            Some(DEFAULT_GLIBC_DEBIAN_VERSION)
+        );
+        assert_eq!(
+            base("[tool.pixi-oci]\nbase = { shadow-setup = false, glibc = false }\n"),
+            Some(BaseSpec::Scratch(ScratchBase {
+                shadow_setup: false,
+                glibc: GlibcSpec::Enabled(false),
+            }))
+        );
+        assert!(
+            toml::from_str::<Manifest>("[tool.pixi-oci]\nbase = { glibcc = false }\n").is_err()
+        );
     }
 
     #[test]

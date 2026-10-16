@@ -8,9 +8,10 @@ caddy = "*"
 polars = "*"
 pandas = "*"
 numpy = "*"
+requests = ">=2.34.2,<3"
 
 [tool.pixi-oci]
-base-image = "ubuntu"
+base = { shadow-setup = true, glibc = "2.41-12+deb13u4" }
 copy-to-image = [
   "my-file",
   { source = "my-file2", destination = "/my-file-renamed" },

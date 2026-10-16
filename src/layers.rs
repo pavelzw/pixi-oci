@@ -282,14 +282,16 @@ pub fn entry_mtime() -> u64 {
 }
 
 enum TarEntry {
-    Dir,
+    /// A directory with its permission bits.
+    Dir(u32),
     File(PathBuf),
 }
 
 /// Write a planned layer as a gzip-compressed tar blob into the OCI directory.
 ///
 /// Entries are sorted, parent directories are emitted explicitly, ownership is root, mtimes are
-/// fixed and hard links are deduplicated so the result is reproducible.
+/// fixed and hard links are deduplicated so the result is reproducible. Directories listed
+/// explicitly keep their permission bits (e.g. the sticky `/tmp`), implicit ones get `0755`.
 pub fn write_layer(oci: &OciDir, layer: &PlannedLayer) -> Result<Layer> {
     let mtime = entry_mtime();
     let mut entries: BTreeMap<String, TarEntry> = BTreeMap::new();
@@ -305,11 +307,22 @@ pub fn write_layer(oci: &OciDir, layer: &PlannedLayer) -> Result<Layer> {
                 parent.push('/');
             }
             parent.push_str(part);
-            entries.entry(parent.clone()).or_insert(TarEntry::Dir);
+            entries
+                .entry(parent.clone())
+                .or_insert(TarEntry::Dir(0o755));
+        }
+        let metadata = fs::symlink_metadata(&file.host_path)
+            .with_context(|| format!("could not stat {}", file.host_path.display()))?;
+        if metadata.is_dir() {
+            entries.insert(
+                rel.to_string(),
+                TarEntry::Dir(metadata.permissions().mode() & 0o7777),
+            );
+            continue;
         }
         match entries.insert(rel.to_string(), TarEntry::File(file.host_path.clone())) {
             None | Some(TarEntry::File(_)) => {}
-            Some(TarEntry::Dir) => bail!(
+            Some(TarEntry::Dir(_)) => bail!(
                 "{} is both a directory and a file in layer `{}`",
                 file.image_path,
                 layer.description
@@ -326,10 +339,10 @@ pub fn write_layer(oci: &OciDir, layer: &PlannedLayer) -> Result<Layer> {
     let mut emitted_dirs: BTreeSet<String> = BTreeSet::new();
     for (path, entry) in &entries {
         match entry {
-            TarEntry::Dir => {
+            TarEntry::Dir(mode) => {
                 let mut header = Header::new_gnu();
                 header.set_entry_type(EntryType::Directory);
-                header.set_mode(0o755);
+                header.set_mode(*mode);
                 header.set_size(0);
                 set_common(&mut header, mtime);
                 builder

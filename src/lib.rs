@@ -12,6 +12,7 @@ pub mod image;
 pub mod install;
 pub mod layers;
 pub mod lockfile;
+pub mod rootfs;
 
 use std::path::{Path, PathBuf};
 
@@ -26,13 +27,14 @@ use crate::{
     archive::{DockerManifestEntry, Output, blob_path, write_docker_manifest, write_oci_archive},
     base_image::{TargetPlatform, fetch_base_image},
     config::{
-        DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS, DEFAULT_TAG,
-        LoadedManifest, SCRATCH,
+        BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
+        DEFAULT_TAG, LoadedManifest,
     },
     image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
     install::{install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
+    rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
 };
 
 /// Output format of a build.
@@ -74,6 +76,8 @@ pub struct BuildReport {
     pub manifest_digest: String,
     pub config_digest: String,
     pub base_layers: usize,
+    /// Layers of a scratch base's root filesystem (glibc, shadow setup).
+    pub rootfs_layers: usize,
     pub package_layers: usize,
     pub copy_layer: bool,
     pub packages: usize,
@@ -138,11 +142,12 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     }
     let install_prefix = config::normalize_image_path(&install_prefix);
     let max_layers = cfg.max_layers.unwrap_or(DEFAULT_MAX_LAYERS);
-    let base_image = options
+    let base_spec = options
         .base_image
         .clone()
-        .or_else(|| cfg.base_image.clone())
-        .unwrap_or_else(|| SCRATCH.to_string());
+        .map(BaseSpec::Image)
+        .or_else(|| cfg.base.clone())
+        .unwrap_or_default();
     let activation_shell = cfg
         .activation_shell
         .clone()
@@ -189,6 +194,15 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         locked.records.len()
     );
 
+    if let BaseSpec::Scratch(scratch) = &base_spec {
+        let glibc = scratch
+            .glibc
+            .debian_version()
+            .map(upstream_glibc_version)
+            .transpose()?;
+        check_glibc(&locked.records, glibc.as_ref())?;
+    }
+
     let cache_dir = match &options.cache_dir {
         Some(dir) => dir.clone(),
         None => rattler_cache::default_cache_dir()
@@ -198,8 +212,25 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let base_cache = OciDir::ensure(open_dir(&base_cache_dir)?)
         .context("could not open the base image cache")?;
 
-    // Pull the base image while nothing else needs the network heavily.
-    let base = fetch_base_image(&base_image, &platform, &base_cache).await?;
+    let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
+    let client = reqwest_client_from_config(&rattler_config)?;
+
+    // Fetch the base while nothing else needs the network heavily: pull the registry image, or
+    // assemble the root filesystem for a scratch base.
+    let rootfs_staging = tempfile::Builder::new()
+        .prefix("pixi-oci-rootfs-")
+        .tempdir()
+        .context("could not create a temporary directory")?;
+    let (base, rootfs_layers) = match &base_spec {
+        BaseSpec::Image(image) => (
+            fetch_base_image(image, &platform, &base_cache).await?,
+            Vec::new(),
+        ),
+        BaseSpec::Scratch(scratch) => (
+            None,
+            plan_rootfs_layers(scratch, subdir, &client, &cache_dir, rootfs_staging.path()).await?,
+        ),
+    };
 
     // Install the environment into a staging directory mirroring the in-image layout.
     let staging = tempfile::Builder::new()
@@ -208,8 +239,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .context("could not create a temporary directory")?;
     let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
     std::fs::create_dir_all(&staging_prefix)?;
-    let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
-    let client = reqwest_client_from_config(&rattler_config)?;
     let packages = locked.records.len();
     eprintln!("⬇️  Installing {packages} packages into {install_prefix}");
     install_environment(
@@ -252,12 +281,14 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .or_else(|| base_config.and_then(|c| c.working_dir().clone()))
         .unwrap_or_else(|| "/".to_string());
 
-    let mut layers = plan_package_layers(
+    let mut layers = rootfs_layers;
+    let rootfs_layer_count = layers.len();
+    layers.extend(plan_package_layers(
         &staging_prefix,
         &install_prefix,
         &PopularitySplitter { max_layers },
-    )?;
-    let package_layers = layers.len();
+    )?);
+    let package_layers = layers.len() - rootfs_layer_count;
     let copy_layer = plan_copy_layer(&loaded.dir, &cfg.copy_to_image, &working_dir)?;
     let has_copy_layer = copy_layer.is_some();
     layers.extend(copy_layer);
@@ -356,6 +387,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         manifest_digest,
         config_digest,
         base_layers: base.as_ref().map_or(0, |b| b.layers.len()),
+        rootfs_layers: rootfs_layer_count,
         package_layers,
         copy_layer: has_copy_layer,
         packages,
