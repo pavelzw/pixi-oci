@@ -6,9 +6,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use oci_client::Reference;
 use oci_spec::image::{
-    Config, ConfigBuilder, Descriptor, HistoryBuilder, ImageConfiguration,
-    ImageConfigurationBuilder, ImageIndexBuilder, ImageManifest, ImageManifestBuilder, MediaType,
-    Os, RootFsBuilder, SCHEMA_VERSION,
+    Config, Descriptor, HistoryBuilder, ImageConfiguration, ImageConfigurationBuilder,
+    ImageIndexBuilder, ImageManifest, ImageManifestBuilder, MediaType, Os, RootFsBuilder,
+    SCHEMA_VERSION,
 };
 use ocidir::{OciDir, OciRead};
 use serde::Serialize;
@@ -22,22 +22,6 @@ use crate::{
 pub const REF_NAME_ANNOTATION: &str = "org.opencontainers.image.ref.name";
 /// Annotation containerd (and therefore `docker load`) prefers for the image name.
 pub const CONTAINERD_NAME_ANNOTATION: &str = "io.containerd.image.name";
-
-/// User-facing image settings that end up in the config.
-#[derive(Debug, Default, Clone)]
-pub struct ImageSettings {
-    pub env: Vec<String>,
-    pub entrypoint: Option<Vec<String>>,
-    pub cmd: Option<Vec<String>>,
-    pub working_dir: Option<String>,
-    pub user: Option<String>,
-    pub labels: HashMap<String, String>,
-    pub exposed_ports: Vec<String>,
-    pub volumes: Vec<String>,
-    pub stop_signal: Option<String>,
-    /// `[shell, wrapper-script]` prepended to the entrypoint when activation scripts exist.
-    pub wrapper: Option<Vec<String>>,
-}
 
 /// Where the image ends up in the layout.
 #[derive(Debug, Clone)]
@@ -56,88 +40,62 @@ pub fn created_timestamp() -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Merge the base image config with the user settings, following Dockerfile semantics:
-/// setting an entrypoint resets an inherited cmd; labels, ports and volumes accumulate.
-pub fn merge_config(base: Option<&Config>, settings: &ImageSettings) -> Result<Config> {
-    let mut builder = ConfigBuilder::default();
+/// Merge the base image config with the user's config, following Dockerfile semantics:
+/// fields set in `overlay` win, setting an entrypoint resets an inherited cmd, and labels,
+/// ports and volumes accumulate.
+pub fn merge_config(base: Option<&Config>, overlay: &Config) -> Config {
+    let base = base.cloned().unwrap_or_default();
+    let mut merged = Config::default();
 
-    let (entrypoint, cmd) = match (&settings.entrypoint, &settings.cmd) {
+    let (entrypoint, cmd) = match (overlay.entrypoint(), overlay.cmd()) {
         (Some(e), cmd) => (Some(e.clone()), cmd.clone()),
-        (None, Some(c)) => (base.and_then(|b| b.entrypoint().clone()), Some(c.clone())),
-        (None, None) => (
-            base.and_then(|b| b.entrypoint().clone()),
-            base.and_then(|b| b.cmd().clone()),
-        ),
+        (None, Some(c)) => (base.entrypoint().clone(), Some(c.clone())),
+        (None, None) => (base.entrypoint().clone(), base.cmd().clone()),
     };
-    let entrypoint = match &settings.wrapper {
-        Some(wrapper) => {
-            let mut full = wrapper.clone();
-            full.extend(entrypoint.unwrap_or_default());
-            Some(full)
-        }
-        None => entrypoint,
-    };
-    if let Some(entrypoint) = entrypoint {
-        builder = builder.entrypoint(entrypoint);
-    }
-    if let Some(cmd) = cmd {
-        builder = builder.cmd(cmd);
-    }
+    merged.set_entrypoint(entrypoint);
+    merged.set_cmd(cmd);
 
-    builder = builder.env(settings.env.clone());
+    merged.set_env(overlay.env().clone().or_else(|| base.env().clone()));
+    merged.set_working_dir(
+        overlay
+            .working_dir()
+            .clone()
+            .or_else(|| base.working_dir().clone()),
+    );
+    merged.set_user(overlay.user().clone().or_else(|| base.user().clone()));
+    merged.set_stop_signal(
+        overlay
+            .stop_signal()
+            .clone()
+            .or_else(|| base.stop_signal().clone()),
+    );
 
-    if let Some(working_dir) = settings
-        .working_dir
-        .clone()
-        .or_else(|| base.and_then(|b| b.working_dir().clone()))
-    {
-        builder = builder.working_dir(working_dir);
-    }
-    if let Some(user) = settings
-        .user
-        .clone()
-        .or_else(|| base.and_then(|b| b.user().clone()))
-    {
-        builder = builder.user(user);
-    }
-    if let Some(stop_signal) = settings
-        .stop_signal
-        .clone()
-        .or_else(|| base.and_then(|b| b.stop_signal().clone()))
-    {
-        builder = builder.stop_signal(stop_signal);
-    }
+    let mut labels: HashMap<String, String> = base.labels().clone().unwrap_or_default();
+    labels.extend(overlay.labels().clone().unwrap_or_default());
+    merged.set_labels(Some(labels).filter(|l| !l.is_empty()));
 
-    let mut labels: HashMap<String, String> =
-        base.and_then(|b| b.labels().clone()).unwrap_or_default();
-    labels.extend(settings.labels.clone());
-    if !labels.is_empty() {
-        builder = builder.labels(labels);
-    }
+    merged.set_exposed_ports(union(base.exposed_ports(), overlay.exposed_ports()));
+    merged.set_volumes(union(base.volumes(), overlay.volumes()));
 
-    let mut ports: Vec<String> = base
-        .and_then(|b| b.exposed_ports().clone())
-        .unwrap_or_default();
-    for port in &settings.exposed_ports {
-        if !ports.contains(port) {
-            ports.push(port.clone());
+    merged
+}
+
+/// `base` followed by the entries of `extra` not already in it; `None` when empty.
+fn union(base: &Option<Vec<String>>, extra: &Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut out = base.clone().unwrap_or_default();
+    for item in extra.iter().flatten() {
+        if !out.contains(item) {
+            out.push(item.clone());
         }
     }
-    if !ports.is_empty() {
-        builder = builder.exposed_ports(ports);
-    }
+    Some(out).filter(|o| !o.is_empty())
+}
 
-    let mut volumes: Vec<String> = base.and_then(|b| b.volumes().clone()).unwrap_or_default();
-    for volume in &settings.volumes {
-        if !volumes.contains(volume) {
-            volumes.push(volume.clone());
-        }
-    }
-    if !volumes.is_empty() {
-        builder = builder.volumes(volumes);
-    }
-
-    Ok(builder.build()?)
+/// Prepend `prefix` (e.g. `[shell, wrapper-script]`) to the entrypoint of `config`.
+pub fn prepend_entrypoint(config: &mut Config, prefix: Vec<String>) {
+    let mut entrypoint = prefix;
+    entrypoint.extend(config.entrypoint().clone().unwrap_or_default());
+    config.set_entrypoint(Some(entrypoint));
 }
 
 /// Inputs for [`assemble_image`].
@@ -263,6 +221,8 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
 
 #[cfg(test)]
 mod tests {
+    use oci_spec::image::ConfigBuilder;
+
     use super::*;
 
     fn base() -> Config {
@@ -278,11 +238,11 @@ mod tests {
 
     #[test]
     fn entrypoint_resets_inherited_cmd() {
-        let settings = ImageSettings {
-            entrypoint: Some(vec!["caddy".into()]),
-            ..Default::default()
-        };
-        let merged = merge_config(Some(&base()), &settings).unwrap();
+        let overlay = ConfigBuilder::default()
+            .entrypoint(vec!["caddy".to_string()])
+            .build()
+            .unwrap();
+        let merged = merge_config(Some(&base()), &overlay);
         assert_eq!(
             merged.entrypoint().as_deref(),
             Some(&["caddy".to_string()][..])
@@ -293,12 +253,12 @@ mod tests {
 
     #[test]
     fn inherits_when_unset_and_merges_labels() {
-        let settings = ImageSettings {
-            labels: HashMap::from([("b".to_string(), "mine".to_string())]),
-            exposed_ports: vec!["80/tcp".into(), "8080/tcp".into()],
-            ..Default::default()
-        };
-        let merged = merge_config(Some(&base()), &settings).unwrap();
+        let overlay = ConfigBuilder::default()
+            .labels(HashMap::from([("b".to_string(), "mine".to_string())]))
+            .exposed_ports(vec!["80/tcp".to_string(), "8080/tcp".to_string()])
+            .build()
+            .unwrap();
+        let merged = merge_config(Some(&base()), &overlay);
         assert_eq!(
             merged.entrypoint().as_deref(),
             Some(&["/base-entry".to_string()][..])
@@ -314,15 +274,18 @@ mod tests {
 
     #[test]
     fn wrapper_is_prepended() {
-        let settings = ImageSettings {
-            entrypoint: Some(vec!["caddy".into(), "run".into()]),
-            wrapper: Some(vec![
+        let overlay = ConfigBuilder::default()
+            .entrypoint(vec!["caddy".to_string(), "run".to_string()])
+            .build()
+            .unwrap();
+        let mut merged = merge_config(None, &overlay);
+        prepend_entrypoint(
+            &mut merged,
+            vec![
                 "/bin/bash".into(),
                 "/opt/env/etc/pixi-oci/entrypoint.sh".into(),
-            ]),
-            ..Default::default()
-        };
-        let merged = merge_config(None, &settings).unwrap();
+            ],
+        );
         assert_eq!(
             merged.entrypoint().as_deref(),
             Some(

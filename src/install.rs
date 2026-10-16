@@ -1,16 +1,16 @@
 //! Downloading and installing the locked packages into a staging prefix.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use rattler::install::{IndicatifReporter, Installer};
 use rattler_cache::{PACKAGE_CACHE_DIR, package_cache::PackageCache};
 use rattler_conda_types::{RepoDataRecord, Subdir};
 use rattler_networking::{
-    AuthenticationMiddleware, AuthenticationStorage, MirrorMiddleware, mirror_middleware::Mirror,
+    AuthenticationMiddleware, AuthenticationStorage, MirrorMiddleware,
+    authentication_storage::backends::file::FileStorage, proxy::proxies_from_config,
 };
 use reqwest_middleware::ClientWithMiddleware;
-use url::Url;
 
 /// The rattler/pixi configuration file type (mirrors, authentication, ...).
 pub type Config = rattler_config::config::ConfigBase<rattler_config::config::NoExtension>;
@@ -24,51 +24,43 @@ pub fn load_config(path: Option<&Path>) -> Result<Option<Config>> {
     .transpose()
 }
 
-/// Create a download client with mirror and authentication middleware, like pixi does.
-pub fn reqwest_client_from_config(config: Option<&Config>) -> Result<ClientWithMiddleware> {
-    let auth_storage = AuthenticationStorage::from_env_and_defaults()?;
-
-    let mut mirror_map: HashMap<Url, Vec<Mirror>> = HashMap::new();
-    if let Some(config) = config {
-        for (key, values) in &config.mirrors {
-            let mirrors = values
-                .iter()
-                .map(|url| Mirror {
-                    url: ensure_trailing_slash(url),
-                    no_bz2: false,
-                    no_zstd: false,
-                    max_failures: None,
-                })
-                .collect();
-            mirror_map.insert(ensure_trailing_slash(key), mirrors);
+/// Create a download client like pixi does: mirrors, proxies, TLS verification and the
+/// authentication file are taken from `config`.
+pub fn reqwest_client_from_config(config: &Config) -> Result<ClientWithMiddleware> {
+    let auth_storage = match &config.authentication_override_file {
+        Some(path) => {
+            let mut storage = AuthenticationStorage::empty();
+            storage.add_backend(Arc::new(
+                FileStorage::from_path(path.clone()).with_context(|| {
+                    format!("could not read authentication file {}", path.display())
+                })?,
+            ));
+            storage
         }
+        None => AuthenticationStorage::from_env_and_defaults()?,
+    };
+
+    let mut builder = reqwest::Client::builder()
+        .no_gzip()
+        .pool_max_idle_per_host(20)
+        .user_agent(format!("pixi-oci/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(5 * 60))
+        .danger_accept_invalid_certs(config.tls_no_verify.unwrap_or(false));
+    for proxy in proxies_from_config(&config.proxy_config).context("invalid proxy configuration")? {
+        builder = builder.proxy(proxy);
     }
 
     let client = reqwest_middleware::ClientBuilder::new(
-        reqwest::Client::builder()
-            .no_gzip()
-            .pool_max_idle_per_host(20)
-            .user_agent(format!("pixi-oci/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(5 * 60))
+        builder
             .build()
             .context("could not create download client")?,
     )
-    .with(MirrorMiddleware::from_map(mirror_map))
+    .with(MirrorMiddleware::from_config(config))
     .with_arc(Arc::new(AuthenticationMiddleware::from_auth_storage(
         auth_storage,
     )))
     .build();
     Ok(client)
-}
-
-fn ensure_trailing_slash(url: &Url) -> Url {
-    if url.path().ends_with('/') {
-        url.clone()
-    } else {
-        format!("{url}/")
-            .parse()
-            .expect("appending a slash keeps the URL valid")
-    }
 }
 
 /// Install `records` into `staging_prefix` on the host. Hardcoded prefix paths inside the files

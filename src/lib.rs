@@ -13,10 +13,7 @@ pub mod install;
 pub mod layers;
 pub mod lockfile;
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Arch;
@@ -32,9 +29,9 @@ use crate::{
         DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS, DEFAULT_TAG,
         LoadedManifest, SCRATCH,
     },
-    image::{AssembleInputs, ImageSettings, assemble_image, created_timestamp, merge_config},
+    image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
     install::{install_environment, load_config, reqwest_client_from_config},
-    layers::{plan_copy_layer, plan_package_layers},
+    layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
 };
 
@@ -211,8 +208,8 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .context("could not create a temporary directory")?;
     let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
     std::fs::create_dir_all(&staging_prefix)?;
-    let rattler_config = load_config(options.rattler_config.as_deref())?;
-    let client = reqwest_client_from_config(rattler_config.as_ref())?;
+    let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
+    let client = reqwest_client_from_config(&rattler_config)?;
     let packages = locked.records.len();
     eprintln!("⬇️  Installing {packages} packages into {install_prefix}");
     install_environment(
@@ -255,47 +252,23 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .or_else(|| base_config.and_then(|c| c.working_dir().clone()))
         .unwrap_or_else(|| "/".to_string());
 
-    let mut layers = plan_package_layers(&staging_prefix, &install_prefix, max_layers)?;
+    let mut layers = plan_package_layers(
+        &staging_prefix,
+        &install_prefix,
+        &PopularitySplitter { max_layers },
+    )?;
     let package_layers = layers.len();
     let copy_layer = plan_copy_layer(&loaded.dir, &cfg.copy_to_image, &working_dir)?;
     let has_copy_layer = copy_layer.is_some();
     layers.extend(copy_layer);
 
-    let settings = ImageSettings {
-        env: activation.env,
-        entrypoint: cfg
-            .oci_config
-            .entrypoint
-            .as_ref()
-            .map(|e| e.to_argv())
-            .transpose()?,
-        cmd: cfg
-            .oci_config
-            .cmd
-            .as_ref()
-            .map(|c| c.to_argv())
-            .transpose()?,
-        working_dir: cfg.oci_config.working_dir.clone(),
-        user: cfg.oci_config.user.clone(),
-        labels: cfg
-            .oci_config
-            .labels
-            .clone()
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
-        exposed_ports: cfg
-            .oci_config
-            .exposed_ports
-            .iter()
-            .map(|p| p.to_port_string())
-            .collect(),
-        volumes: cfg.oci_config.volumes.clone(),
-        stop_signal: cfg.oci_config.stop_signal.clone(),
-        wrapper: activation
-            .wrapper
-            .map(|wrapper| vec![activation_shell.clone(), wrapper]),
-    };
-    let merged = merge_config(base_config, &settings)?;
+    let mut user_config = cfg.oci_config.to_oci_config()?;
+    // The activation env already contains the base image env and the user's env.
+    user_config.set_env(Some(activation.env));
+    let mut merged = merge_config(base_config, &user_config);
+    if let Some(wrapper) = activation.wrapper {
+        prepend_entrypoint(&mut merged, vec![activation_shell, wrapper]);
+    }
 
     // Decide where the layout goes.
     let default_output = match options.format {

@@ -1,11 +1,13 @@
 //! Parsing of `pixi.toml` (or `pyproject.toml`) and the `[tool.pixi-oci]` section.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use oci_spec::image::Config;
 use serde::Deserialize;
 
 /// Default location of the environment inside the image.
@@ -13,7 +15,7 @@ pub const DEFAULT_INSTALL_PREFIX: &str = "/opt/env";
 /// Default image tag.
 pub const DEFAULT_TAG: &str = "latest";
 /// Default maximum number of package layers.
-pub const DEFAULT_MAX_LAYERS: usize = 20;
+pub const DEFAULT_MAX_LAYERS: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 /// Default interpreter used for the activation wrapper script.
 pub const DEFAULT_ACTIVATION_SHELL: &str = "/bin/bash";
 /// Pseudo base image meaning "start from an empty root filesystem".
@@ -117,7 +119,7 @@ pub struct PixiOciConfig {
     /// Image tag.
     pub tag: Option<String>,
     /// Maximum number of layers used for the conda packages.
-    pub max_layers: Option<usize>,
+    pub max_layers: Option<NonZeroUsize>,
     /// Additional files to copy into the image.
     #[serde(default)]
     pub copy_to_image: Vec<CopyEntry>,
@@ -199,6 +201,7 @@ pub fn normalize_image_path(path: &str) -> String {
 ///
 /// Field names follow the docker image spec, in kebab-case. The spec's PascalCase names are
 /// accepted as aliases.
+/// We keep our own struct instead of deserializing `oci_spec::image::Config` for nicer TOML.
 #[derive(Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct OciConfigSection {
@@ -220,6 +223,51 @@ pub struct OciConfigSection {
     pub volumes: Vec<String>,
     #[serde(alias = "StopSignal")]
     pub stop_signal: Option<String>,
+}
+
+impl OciConfigSection {
+    /// Convert into an OCI image [`Config`]. Unset fields stay `None` so they can be inherited
+    /// from the base image (see [`crate::image::merge_config`]).
+    pub fn to_oci_config(&self) -> Result<Config> {
+        let mut config = Config::default();
+        config.set_entrypoint(
+            self.entrypoint
+                .as_ref()
+                .map(StringOrVec::to_argv)
+                .transpose()?,
+        );
+        config.set_cmd(self.cmd.as_ref().map(StringOrVec::to_argv).transpose()?);
+        config.set_env(
+            self.env
+                .as_ref()
+                .map(|env| -> Result<Vec<String>> {
+                    Ok(env
+                        .to_pairs()?
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect())
+                })
+                .transpose()?,
+        );
+        config.set_working_dir(self.working_dir.clone());
+        config.set_user(self.user.clone());
+        config.set_labels(
+            Some(self.labels.clone().into_iter().collect::<HashMap<_, _>>())
+                .filter(|l| !l.is_empty()),
+        );
+        config.set_exposed_ports(
+            Some(
+                self.exposed_ports
+                    .iter()
+                    .map(PortSpec::to_port_string)
+                    .collect::<Vec<_>>(),
+            )
+            .filter(|p| !p.is_empty()),
+        );
+        config.set_volumes(Some(self.volumes.clone()).filter(|v| !v.is_empty()));
+        config.set_stop_signal(self.stop_signal.clone());
+        Ok(config)
+    }
 }
 
 /// A command given either as a shell-like string or as an argv list.
@@ -417,7 +465,7 @@ mod tests {
         let m = parse(include_str!("../example/pixi.toml"));
         let cfg = m.tool.pixi_oci;
         assert_eq!(cfg.base_image.as_deref(), Some("ubuntu"));
-        assert_eq!(cfg.max_layers, Some(20));
+        assert_eq!(cfg.max_layers, NonZeroUsize::new(20));
         assert_eq!(cfg.copy_to_image.len(), 2);
         assert_eq!(
             cfg.oci_config.entrypoint.unwrap().to_argv().unwrap(),
@@ -459,6 +507,31 @@ exposed-ports = [8080, "9090", "53/udp"]
             .map(PortSpec::to_port_string)
             .collect();
         assert_eq!(ports, vec!["8080/tcp", "9090/tcp", "53/udp"]);
+    }
+
+    #[test]
+    fn converts_to_oci_config() {
+        let m = parse(
+            r#"
+[tool.pixi-oci.oci-config]
+cmd = "serve --port 80"
+env = { FOO = "bar" }
+exposed-ports = [8080]
+"#,
+        );
+        let config = m.tool.pixi_oci.oci_config.to_oci_config().unwrap();
+        assert!(config.entrypoint().is_none());
+        assert_eq!(
+            config.cmd().as_deref(),
+            Some(&["serve".to_string(), "--port".to_string(), "80".to_string()][..])
+        );
+        assert_eq!(config.env().as_deref(), Some(&["FOO=bar".to_string()][..]));
+        assert_eq!(
+            config.exposed_ports().as_deref(),
+            Some(&["8080/tcp".to_string()][..])
+        );
+        assert!(config.labels().is_none());
+        assert!(config.volumes().is_none());
     }
 
     #[test]

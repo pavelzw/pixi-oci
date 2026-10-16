@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
+    num::NonZeroUsize,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -32,40 +33,55 @@ pub struct PlannedLayer {
     pub files: Vec<FileEntry>,
 }
 
-/// Assign the packages installed in `prefix` to at most `max_layers` layers.
+/// Decides which installed packages share a layer.
 ///
-/// Packages are ordered by how many other packages (transitively) depend on them, so that the
-/// lowest layers hold the packages that change least often. The first `max_layers - 1` packages
-/// each get their own layer, the remaining ones share the last layer together with every file in
-/// the prefix that is not owned by a package.
+/// Implementations return the layers bottom to top, each as the group of packages it holds.
+/// Every package should appear in exactly one group; files of packages left out end up in the
+/// last layer together with the files no package owns.
+pub trait LayerSplitter {
+    fn split<'a>(&self, packages: &'a [PrefixRecord]) -> Result<Vec<Vec<&'a PrefixRecord>>>;
+}
+
+/// Orders packages by how many other packages (transitively) depend on them, so that the
+/// lowest layers hold the packages that change least often. The first `max_layers - 1`
+/// packages each get their own layer, the remaining ones share the last layer.
+#[derive(Debug, Clone, Copy)]
+pub struct PopularitySplitter {
+    pub max_layers: NonZeroUsize,
+}
+
+impl LayerSplitter for PopularitySplitter {
+    fn split<'a>(&self, packages: &'a [PrefixRecord]) -> Result<Vec<Vec<&'a PrefixRecord>>> {
+        let mut groups: Vec<Vec<&PrefixRecord>> = Vec::new();
+        for record in order_by_popularity(packages) {
+            if groups.len() == self.max_layers.get() {
+                groups
+                    .last_mut()
+                    .expect("max_layers is non-zero so a group exists")
+                    .push(record);
+            } else {
+                groups.push(vec![record]);
+            }
+        }
+        Ok(groups)
+    }
+}
+
+/// Split the packages installed in `prefix` into layers using `splitter`. Every file in the
+/// prefix that is not owned by a package goes into the last layer.
 pub fn plan_package_layers(
     prefix: &Path,
     install_prefix: &str,
-    max_layers: usize,
+    splitter: &dyn LayerSplitter,
 ) -> Result<Vec<PlannedLayer>> {
-    if max_layers == 0 {
-        bail!("max-layers must be at least 1");
-    }
     let records = PrefixRecord::collect_from_prefix::<PrefixRecord>(prefix)
         .context("could not read conda-meta of the installed prefix")?;
-    let ordered = order_by_popularity(&records);
-
-    // The first `max_layers - 1` packages get their own layer, everything else shares the last.
-    let mut groups: Vec<Vec<&PrefixRecord>> = Vec::new();
-    for record in &ordered {
-        if groups.len() == max_layers {
-            groups
-                .last_mut()
-                .expect("max_layers >= 1 so a group exists")
-                .push(record);
-        } else {
-            groups.push(vec![record]);
-        }
-    }
+    let groups = splitter.split(&records)?;
 
     let mut owned: HashSet<PathBuf> = HashSet::new();
     let mut layers: Vec<PlannedLayer> = groups
         .iter()
+        .filter(|group| !group.is_empty())
         .map(|group| {
             let mut files = Vec::new();
             for record in group {
