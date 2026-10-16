@@ -2,6 +2,7 @@
 //! `libc6` package and the user database files a shadow setup provides.
 
 use std::{
+    borrow::Cow,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
@@ -128,10 +129,16 @@ pub async fn plan_rootfs_layers(
 ) -> Result<Vec<PlannedLayer>> {
     let mut layers = Vec::new();
     if let Some(version) = base.glibc.debian_version() {
-        let deb = fetch_deb(client, cache_dir, "libc6", version, debian_arch(subdir)?).await?;
+        let arch = debian_arch(subdir)?;
+        let deb: Cow<'static, [u8]> = match bundled_deb("libc6", version, arch) {
+            Some(deb) => Cow::Borrowed(deb),
+            None => Cow::Owned(fs::read(
+                fetch_deb(client, cache_dir, "libc6", version, arch).await?,
+            )?),
+        };
         let root = staging.join("glibc");
         extract_deb(&deb, &root, keep_glibc_file)
-            .with_context(|| format!("could not extract {}", deb.display()))?;
+            .with_context(|| format!("could not extract libc6 {version} ({arch})"))?;
         // Debian gets these from `base-files` (merged /usr). Binaries look up the dynamic
         // loader through them, e.g. /lib64/ld-linux-x86-64.so.2.
         symlink("usr/lib", root.join("lib"))?;
@@ -199,6 +206,34 @@ fn keep_glibc_file(path: &Path) -> bool {
         return path.ends_with("/copyright");
     }
     !path.starts_with("usr/share/lintian/") && !path.contains("/gconv/")
+}
+
+/// Debian packages embedded with the `bundled-glibc` feature (see `build.rs`).
+#[cfg(feature = "bundled-glibc")]
+mod bundled {
+    /// A `.deb` together with the fields of its `control` file, read by `build.rs`.
+    pub struct BundledDeb {
+        pub package: &'static str,
+        pub version: &'static str,
+        pub architecture: &'static str,
+        pub data: &'static [u8],
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/bundled_glibc.rs"));
+}
+
+/// The bundled `.deb` for `package` `version` on `arch`, if there is one.
+#[cfg(feature = "bundled-glibc")]
+fn bundled_deb(package: &str, version: &str, arch: &str) -> Option<&'static [u8]> {
+    bundled::DEBS
+        .iter()
+        .find(|deb| deb.package == package && deb.version == version && deb.architecture == arch)
+        .map(|deb| deb.data)
+}
+
+#[cfg(not(feature = "bundled-glibc"))]
+fn bundled_deb(_package: &str, _version: &str, _arch: &str) -> Option<&'static [u8]> {
+    None
 }
 
 #[derive(Deserialize)]
@@ -278,12 +313,8 @@ async fn fetch_deb(
 
 /// Unpack the `data.tar.xz` of a `.deb` into `dest`, keeping only the paths `keep` accepts.
 /// Directories are created as needed rather than taken from the archive.
-fn extract_deb(deb: &Path, dest: &Path, keep: impl Fn(&Path) -> bool) -> Result<()> {
-    let bytes = fs::read(deb)?;
-    let data = ar_members(&bytes)?
-        .into_iter()
-        .find_map(|(name, data)| (name == "data.tar.xz").then_some(data))
-        .ok_or_else(|| anyhow!("no data.tar.xz in the package"))?;
+fn extract_deb(deb: &[u8], dest: &Path, keep: impl Fn(&Path) -> bool) -> Result<()> {
+    let data = ar_member(deb, "data.tar.xz")?;
     fs::create_dir_all(dest)?;
     let mut archive = tar::Archive::new(liblzma::read::XzDecoder::new(data));
     for entry in archive.entries()? {
@@ -304,18 +335,18 @@ fn extract_deb(deb: &Path, dest: &Path, keep: impl Fn(&Path) -> bool) -> Result<
     Ok(())
 }
 
-/// The members (name, contents) of a Unix `ar` archive, the container format of `.deb` files.
-fn ar_members(data: &[u8]) -> Result<Vec<(&str, &[u8])>> {
+/// The contents of the member `name` of a Unix `ar` archive, the container format of `.deb`
+/// files.
+fn ar_member<'a>(data: &'a [u8], name: &str) -> Result<&'a [u8]> {
     let mut rest = data
         .strip_prefix(b"!<arch>\n")
         .ok_or_else(|| anyhow!("not an ar archive"))?;
-    let mut members = Vec::new();
     while !rest.is_empty() {
         if rest.len() < 60 {
             bail!("truncated ar header");
         }
         let (header, body) = rest.split_at(60);
-        let name = std::str::from_utf8(&header[..16])?
+        let member = std::str::from_utf8(&header[..16])?
             .trim_end()
             .trim_end_matches('/');
         let size: usize = std::str::from_utf8(&header[48..58])?
@@ -323,18 +354,36 @@ fn ar_members(data: &[u8]) -> Result<Vec<(&str, &[u8])>> {
             .parse()
             .context("invalid ar member size")?;
         if body.len() < size {
-            bail!("truncated ar member `{name}`");
+            bail!("truncated ar member `{member}`");
         }
-        members.push((name, &body[..size]));
+        if member == name {
+            return Ok(&body[..size]);
+        }
         // Members are padded to an even size.
         rest = &body[(size + size % 2).min(body.len())..];
     }
-    Ok(members)
+    bail!("no {name} in the package")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "bundled-glibc")]
+    #[test]
+    fn bundles_the_default_glibc() {
+        assert!(!bundled::DEBS.is_empty());
+        // Without an override, build.rs bundles the default version.
+        if option_env!("GLIBC_DEBIAN_FILE").is_none() {
+            let version = crate::config::DEFAULT_GLIBC_DEBIAN_VERSION;
+            for arch in ["amd64", "arm64"] {
+                assert!(
+                    bundled_deb("libc6", version, arch).is_some(),
+                    "libc6 {version} ({arch}) is not bundled"
+                );
+            }
+        }
+    }
 
     #[test]
     fn upstream_versions() {
@@ -381,10 +430,8 @@ mod tests {
                 ar.push(b'\n');
             }
         }
-        let members = ar_members(&ar).unwrap();
-        assert_eq!(
-            members,
-            vec![("debian-binary", &b"2.0\n"[..]), ("odd", &b"abc"[..])]
-        );
+        assert_eq!(ar_member(&ar, "debian-binary").unwrap(), b"2.0\n");
+        assert_eq!(ar_member(&ar, "odd").unwrap(), b"abc");
+        assert!(ar_member(&ar, "missing").is_err());
     }
 }

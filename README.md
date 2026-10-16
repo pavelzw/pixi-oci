@@ -100,6 +100,13 @@ base = { shadow-setup = false, glibc = false }
 
 `--base-image` on the command line overrides `base` with a registry reference (or `scratch`).
 
+Builds of `pixi-oci` with the `bundled-glibc` cargo feature embed the default `libc6` packages for `amd64` and `arm64`, so they are not downloaded at runtime. Other versions and architectures are still downloaded. The build script fetches the packages from snapshot.debian.org; set `GLIBC_DEBIAN_FILE` to one or more local `.deb` files (separated like `PATH`) to bundle those instead and build without network access:
+
+```shell
+GLIBC_DEBIAN_FILE=libc6_2.41-12+deb13u4_amd64.deb:libc6_2.41-12+deb13u4_arm64.deb \
+  cargo build --release --features bundled-glibc
+```
+
 ### Platform selection
 
 The platform comes from `--platform`, then `platform` in the config, then the current machine if it runs linux, then the single linux platform of the environment. With several linux platforms in the lockfile you have to pick one explicitly. Each invocation builds one platform; `linux-64` becomes `linux/amd64`, `linux-aarch64` becomes `linux/arm64/v8`.

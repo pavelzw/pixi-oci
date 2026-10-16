@@ -22,6 +22,9 @@ native-tls = [
   "rattler_cache/native-tls",
   "oci-client/native-tls",
 ]
+# Embed the default glibc (Debian `libc6`) packages so builds need no download for them.
+# Set GLIBC_DEBIAN_FILE to bundle local `.deb` files instead of downloading them.
+bundled-glibc = ["dep:ureq", "dep:sha1", "dep:tar", "dep:liblzma"]
 
 [dependencies]
 anyhow = "1.0"
@@ -69,3 +72,9 @@ codegen-units = 1
 lto = true
 strip = true
 opt-level = "z"
+
+[build-dependencies]
+liblzma = { version = "0.4", default-features = false, features = ["static"], optional = true }
+sha1 = { version = "0.10", optional = true }
+tar = { version = "0.4", optional = true }
+ureq = { version = "3", optional = true }
