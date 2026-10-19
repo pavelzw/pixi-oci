@@ -3,7 +3,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use rattler::install::{IndicatifReporter, Installer};
+use rattler::install::{IndicatifReporter, Installer, LinkOptions};
 use rattler_cache::{PACKAGE_CACHE_DIR, package_cache::PackageCache};
 use rattler_conda_types::{RepoDataRecord, Subdir};
 use rattler_networking::{
@@ -82,6 +82,14 @@ pub async fn install_environment(
         // Link scripts would run against the staging path on the build host, not the
         // final prefix, so they stay disabled.
         .with_execute_link_scripts(false)
+        // On macOS, rattler reflinks whole directories when it can, and whether a shared
+        // directory like `lib/` gets reflinked depends on which package gets there first. That
+        // makes `sha256_in_prefix` in conda-meta non-deterministic and breaks reproducible
+        // layers: https://github.com/conda/rattler/issues/2966
+        .with_link_options(LinkOptions {
+            allow_ref_links: Some(false),
+            ..Default::default()
+        })
         .with_reporter(IndicatifReporter::builder().finish())
         .install(staging_prefix, records)
         .await

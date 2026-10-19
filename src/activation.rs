@@ -2,7 +2,6 @@
 //! plus a small wrapper that sources the `activate.d` scripts before running the command.
 
 use std::{
-    collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -38,8 +37,6 @@ pub struct ActivationInputs<'a> {
     pub subdir: Subdir,
     /// `Env` of the base image.
     pub base_env: &'a [String],
-    /// `[activation.env]` from the pixi manifest.
-    pub manifest_env: &'a BTreeMap<String, String>,
     /// `env` from `[tool.pixi-oci.oci-config]`.
     pub user_env: &'a [(String, String)],
 }
@@ -98,10 +95,8 @@ pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
     for (k, v) in &activator.env_vars {
         env.set(k.clone(), v.clone());
     }
-    for (k, v) in inputs.manifest_env {
-        env.set(k.clone(), v.clone());
-    }
     for (k, v) in inputs.user_env {
+        warn_if_unexpanded(k, v);
         env.set(k.clone(), v.clone());
     }
 
@@ -123,6 +118,16 @@ pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
         env: env.into_strings(),
         wrapper,
     })
+}
+
+/// The image config holds literal values; unlike `pixi shell-hook`, no shell expands
+/// references such as `$CONDA_PREFIX` or `$PATH`.
+fn warn_if_unexpanded(key: &str, value: &str) {
+    if value.contains('$') {
+        tracing::warn!(
+            "environment variable {key}={value} contains `$`, which is not expanded in the image"
+        );
+    }
 }
 
 fn rebase(script: &Path, staging_prefix: &Path, install_prefix: &str) -> Result<String> {
@@ -190,7 +195,6 @@ mod tests {
             install_prefix: "/opt/env",
             subdir: Subdir::Linux64,
             base_env: &["PATH=/usr/bin".to_string(), "LANG=C".to_string()],
-            manifest_env: &BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
             user_env: &[("LANG".to_string(), "C.UTF-8".to_string())],
         })
         .unwrap();
@@ -199,8 +203,7 @@ mod tests {
             vec![
                 "PATH=/opt/env/bin:/usr/bin",
                 "LANG=C.UTF-8",
-                "CONDA_PREFIX=/opt/env",
-                "FOO=bar"
+                "CONDA_PREFIX=/opt/env"
             ]
         );
         assert!(activation.wrapper.is_none());
@@ -218,7 +221,6 @@ mod tests {
             install_prefix: "/opt/env",
             subdir: Subdir::Linux64,
             base_env: &[],
-            manifest_env: &BTreeMap::new(),
             user_env: &[],
         })
         .unwrap();

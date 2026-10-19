@@ -28,7 +28,7 @@ skopeo inspect oci-archive:myapp.tar
 
 ## Configuration
 
-Everything lives in the `[tool.pixi-oci]` table of your `pixi.toml` (or `pyproject.toml`). Command line flags override the corresponding keys.
+Everything lives in the `[tool.pixi-oci]` table of your `pixi.toml` (or `pyproject.toml`). Command line flags override the corresponding keys. The rest of the manifest is not read: the packages come from `pixi.lock`.
 
 ```toml
 [workspace]
@@ -43,7 +43,7 @@ caddy = "*"
 base = { shadow-setup = true, glibc = "2.41-12+deb13u4" }   # or a registry image, see below
 environment = "default"          # pixi environment to install
 install-prefix = "/opt/env"      # where the environment lives inside the image
-name = "example-project"         # image name, defaults to the workspace name
+name = "example-project"         # image name (required unless given with --tag)
 tag = "latest"
 max-layers = 20                  # how many layers the conda packages may use
 copy-to-image = [
@@ -70,7 +70,7 @@ stop-signal = "SIGTERM"
 | `environment` | `default` | The pixi environment to put into the image. |
 | `platform` | see below | Conda platform to build for. Only linux platforms are supported. |
 | `install-prefix` | `/opt/env` | Absolute path of the environment inside the image. |
-| `name` | workspace name | Image repository name. |
+| `name` | | Image repository name. Required unless `--tag name:tag` is given. |
 | `tag` | `latest` | Image tag. |
 | `max-layers` | `20` | Upper bound for the number of layers used by the conda packages. |
 | `copy-to-image` | `[]` | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile. |
@@ -82,7 +82,7 @@ stop-signal = "SIGTERM"
 `base` is either a registry reference or a table describing a root filesystem built from scratch:
 
 ```toml
-# a registry image; credentials come from ~/.docker/config.json, including credential helpers
+# a public registry image, pulled anonymously
 base = "ubuntu:latest"
 
 # from scratch, with glibc and a shadow setup (the default, same as `base = {}`)
@@ -113,11 +113,11 @@ The platform comes from `--platform`, then `platform` in the config, then the cu
 
 ### Environment activation
 
-The image config carries everything `pixi shell-hook` would export: `PATH` with `<install-prefix>/bin` in front, `CONDA_PREFIX`, variables from the packages' `etc/conda/env_vars.d`, your `[activation.env]` tables and `oci-config.env`. Containers therefore start with an activated environment, even for `scratch` images without a shell.
+The image config carries everything `pixi shell-hook` would export: `PATH` with `<install-prefix>/bin` in front, `CONDA_PREFIX`, variables from the packages' `etc/conda/env_vars.d` and `oci-config.env`. Containers therefore start with an activated environment, even for `scratch` images without a shell.
 
 When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a tiny wrapper to `<install-prefix>/etc/pixi-oci/entrypoint.sh` that sources them and then `exec`s your entrypoint. The wrapper is prepended to the entrypoint automatically and needs `activation-shell` to exist in the image: a scratch base has no shell, so add `bash` to the environment and point `activation-shell` at `<install-prefix>/bin/bash`.
 
-`[activation.scripts]` from the manifest are not run; a warning is printed if the environment defines any.
+`[activation]` tables from the manifest (`env` and `scripts`) are not applied.
 
 ### Layers
 
@@ -132,6 +132,7 @@ Conda packages go into the regular rattler package cache, base image layers into
 ## Limitations
 
 - PyPI dependencies in the lockfile are rejected. Use conda packages for now.
+- Only `[tool.pixi-oci]` is read from the manifest. `[activation]` tables are ignored, and `pixi.lock` is not checked against the manifest, so run `pixi lock` after changing dependencies.
 - Source packages (pixi-build) are not supported.
 - One platform per build; there is no multi-arch index yet.
 - `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.

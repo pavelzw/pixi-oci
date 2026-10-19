@@ -23,85 +23,18 @@ pub const SCRATCH: &str = "scratch";
 /// Debian `libc6` version used for `glibc = true`: the glibc of the current Debian stable.
 pub const DEFAULT_GLIBC_DEBIAN_VERSION: &str = "2.41-12+deb13u4";
 
-/// The parts of a pixi manifest that pixi-oci cares about. Everything else is ignored.
+/// A pixi manifest (`pixi.toml` or `pyproject.toml`). Only `[tool.pixi-oci]` is read; the
+/// packages come from `pixi.lock`.
 #[derive(Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
 pub struct Manifest {
     #[serde(default)]
-    pub workspace: Option<WorkspaceSection>,
-    #[serde(default)]
-    pub project: Option<WorkspaceSection>,
-    #[serde(default)]
-    pub activation: Option<ActivationSection>,
-    #[serde(default)]
-    pub feature: BTreeMap<String, FeatureSection>,
-    #[serde(default)]
-    pub environments: BTreeMap<String, EnvironmentSpec>,
-    #[serde(default)]
     pub tool: ToolSection,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct WorkspaceSection {
-    pub name: Option<String>,
-    pub version: Option<String>,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct ActivationSection {
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub scripts: Vec<String>,
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-#[serde(rename_all = "kebab-case")]
-pub struct FeatureSection {
-    #[serde(default)]
-    pub activation: Option<ActivationSection>,
-}
-
-/// `[environments]` entries are either a plain list of features or a table.
-#[derive(Deserialize, Debug, Clone)]
-#[serde(untagged)]
-pub enum EnvironmentSpec {
-    Features(Vec<String>),
-    Table {
-        #[serde(default)]
-        features: Vec<String>,
-        #[serde(default, rename = "no-default-feature")]
-        no_default_feature: bool,
-    },
-}
-
-impl EnvironmentSpec {
-    fn features(&self) -> &[String] {
-        match self {
-            EnvironmentSpec::Features(f) => f,
-            EnvironmentSpec::Table { features, .. } => features,
-        }
-    }
-
-    fn includes_default_feature(&self) -> bool {
-        match self {
-            EnvironmentSpec::Features(_) => true,
-            EnvironmentSpec::Table {
-                no_default_feature, ..
-            } => !no_default_feature,
-        }
-    }
 }
 
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ToolSection {
     #[serde(default, rename = "pixi-oci")]
     pub pixi_oci: PixiOciConfig,
-    /// Only present when the manifest is a `pyproject.toml`.
-    #[serde(default)]
-    pub pixi: Option<Box<Manifest>>,
 }
 
 /// The `[tool.pixi-oci]` section.
@@ -427,20 +360,8 @@ impl LoadedManifest {
         };
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read manifest {}", path.display()))?;
-        let mut manifest: Manifest = toml::from_str(&contents)
+        let manifest: Manifest = toml::from_str(&contents)
             .with_context(|| format!("could not parse manifest {}", path.display()))?;
-
-        // In a pyproject.toml the pixi manifest lives under [tool.pixi].
-        if path.file_name().is_some_and(|f| f == "pyproject.toml") {
-            let pixi_oci = std::mem::take(&mut manifest.tool.pixi_oci);
-            let inner = manifest
-                .tool
-                .pixi
-                .take()
-                .ok_or_else(|| anyhow!("{} has no [tool.pixi] section", path.display()))?;
-            manifest = *inner;
-            manifest.tool.pixi_oci = pixi_oci;
-        }
 
         let dir = path
             .parent()
@@ -456,66 +377,6 @@ impl LoadedManifest {
 
     pub fn config(&self) -> &PixiOciConfig {
         &self.manifest.tool.pixi_oci
-    }
-
-    /// The workspace name from `[workspace]` or the legacy `[project]` table.
-    pub fn workspace_name(&self) -> Option<&str> {
-        self.manifest
-            .workspace
-            .as_ref()
-            .and_then(|w| w.name.as_deref())
-            .or_else(|| {
-                self.manifest
-                    .project
-                    .as_ref()
-                    .and_then(|p| p.name.as_deref())
-            })
-    }
-
-    /// The `[activation.env]` variables that apply to `environment`: the default feature
-    /// first, then every feature of the environment in order (later ones win).
-    pub fn activation_env(&self, environment: &str) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
-        let spec = self.manifest.environments.get(environment);
-        let include_default = spec.is_none_or(EnvironmentSpec::includes_default_feature);
-        if include_default && let Some(activation) = &self.manifest.activation {
-            env.extend(activation.env.clone());
-        }
-        if let Some(spec) = spec {
-            for feature in spec.features() {
-                if let Some(activation) = self
-                    .manifest
-                    .feature
-                    .get(feature)
-                    .and_then(|f| f.activation.as_ref())
-                {
-                    env.extend(activation.env.clone());
-                }
-            }
-        }
-        env
-    }
-
-    /// Whether the manifest defines any `[activation.scripts]` (unsupported by pixi-oci).
-    pub fn has_activation_scripts(&self, environment: &str) -> bool {
-        let spec = self.manifest.environments.get(environment);
-        let include_default = spec.is_none_or(EnvironmentSpec::includes_default_feature);
-        let default_has = include_default
-            && self
-                .manifest
-                .activation
-                .as_ref()
-                .is_some_and(|a| !a.scripts.is_empty());
-        let feature_has = spec.is_some_and(|spec| {
-            spec.features().iter().any(|f| {
-                self.manifest
-                    .feature
-                    .get(f)
-                    .and_then(|f| f.activation.as_ref())
-                    .is_some_and(|a| !a.scripts.is_empty())
-            })
-        });
-        default_has || feature_has
     }
 }
 
@@ -544,10 +405,7 @@ mod tests {
             cfg.oci_config.entrypoint.unwrap().to_argv().unwrap(),
             vec!["caddy", "file-server", "--browse", "--root", "."]
         );
-        assert_eq!(
-            m.workspace.unwrap().name.as_deref(),
-            Some("example-project")
-        );
+        assert_eq!(cfg.name.as_deref(), Some("example-project"));
     }
 
     #[test]
@@ -667,65 +525,6 @@ exposed-ports = [8080]
             destination: Some("sub/renamed".into()),
         };
         assert_eq!(e.destination("/app").unwrap(), "/app/sub/renamed");
-    }
-
-    #[test]
-    fn activation_env_merges_features_in_order() {
-        let m = Manifest {
-            activation: Some(ActivationSection {
-                env: BTreeMap::from([("A".into(), "default".into()), ("B".into(), "b".into())]),
-                scripts: vec![],
-            }),
-            feature: BTreeMap::from([
-                (
-                    "f1".to_string(),
-                    FeatureSection {
-                        activation: Some(ActivationSection {
-                            env: BTreeMap::from([("A".into(), "f1".into())]),
-                            scripts: vec![],
-                        }),
-                    },
-                ),
-                (
-                    "f2".to_string(),
-                    FeatureSection {
-                        activation: Some(ActivationSection {
-                            env: BTreeMap::from([("A".into(), "f2".into())]),
-                            scripts: vec!["s.sh".into()],
-                        }),
-                    },
-                ),
-            ]),
-            environments: BTreeMap::from([
-                (
-                    "prod".to_string(),
-                    EnvironmentSpec::Features(vec!["f1".into(), "f2".into()]),
-                ),
-                (
-                    "bare".to_string(),
-                    EnvironmentSpec::Table {
-                        features: vec!["f1".into()],
-                        no_default_feature: true,
-                    },
-                ),
-            ]),
-            ..Default::default()
-        };
-        let loaded = LoadedManifest {
-            path: PathBuf::from("pixi.toml"),
-            dir: PathBuf::from("."),
-            manifest: m,
-        };
-        let env = loaded.activation_env("default");
-        assert_eq!(env["A"], "default");
-        let env = loaded.activation_env("prod");
-        assert_eq!(env["A"], "f2");
-        assert_eq!(env["B"], "b");
-        assert!(loaded.has_activation_scripts("prod"));
-        let env = loaded.activation_env("bare");
-        assert_eq!(env["A"], "f1");
-        assert!(!env.contains_key("B"));
-        assert!(!loaded.has_activation_scripts("bare"));
     }
 
     #[test]

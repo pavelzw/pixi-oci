@@ -137,7 +137,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .install_prefix
         .clone()
         .unwrap_or_else(|| DEFAULT_INSTALL_PREFIX.to_string());
-    if !install_prefix.starts_with('/') || install_prefix == "/" {
+    if !install_prefix.starts_with('/') || config::normalize_image_path(&install_prefix) == "/" {
         bail!("install-prefix must be an absolute path below `/`, got `{install_prefix}`");
     }
     let install_prefix = config::normalize_image_path(&install_prefix);
@@ -161,24 +161,19 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             }
             None => (None, None),
         };
-        let name = cli_name
-            .or_else(|| cfg.name.clone())
-            .or_else(|| loaded.workspace_name().map(str::to_string))
-            .ok_or_else(|| {
-                anyhow!("no image name: set `name` in [tool.pixi-oci] or `--tag name:tag`")
-            })?;
+        let name = cli_name.or_else(|| cfg.name.clone()).ok_or_else(|| {
+            anyhow!("no image name: set `name` in [tool.pixi-oci] or `--tag name:tag`")
+        })?;
         let tag = cli_tag
             .or_else(|| cfg.tag.clone())
             .unwrap_or_else(|| DEFAULT_TAG.to_string());
         (name, tag)
     };
     let reference = format!("{name}:{tag}");
-
-    if loaded.has_activation_scripts(&environment) {
-        tracing::warn!(
-            "the manifest defines [activation.scripts]; pixi-oci does not run them in the image"
-        );
-    }
+    // Fail before downloading and installing anything if the registry would reject the name.
+    reference
+        .parse::<oci_client::Reference>()
+        .map_err(|e| anyhow!("invalid image reference `{reference}`: {e}"))?;
 
     let lockfile_path = loaded.dir.join("pixi.lock");
     let locked = load_locked_environment(
@@ -257,7 +252,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let base_env = base_config
         .and_then(|c| c.env().clone())
         .unwrap_or_default();
-    let manifest_env = loaded.activation_env(&environment);
     let user_env = cfg
         .oci_config
         .env
@@ -270,7 +264,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         install_prefix: &install_prefix,
         subdir,
         base_env: &base_env,
-        manifest_env: &manifest_env,
         user_env: &user_env,
     })?;
 

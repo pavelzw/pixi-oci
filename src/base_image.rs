@@ -53,35 +53,6 @@ impl TargetPlatform {
     }
 }
 
-/// Resolve credentials for a registry from `~/.docker/config.json` (including credential
-/// helpers). Falls back to anonymous access.
-pub fn registry_auth(reference: &Reference) -> RegistryAuth {
-    let registry = reference.registry();
-    let candidates: Vec<String> = if registry == "docker.io" || registry == "index.docker.io" {
-        vec![
-            "https://index.docker.io/v1/".to_string(),
-            "index.docker.io".to_string(),
-            "docker.io".to_string(),
-        ]
-    } else {
-        vec![registry.to_string()]
-    };
-    for server in candidates {
-        match docker_credential::get_credential(&server) {
-            Ok(docker_credential::DockerCredential::UsernamePassword(user, pass)) => {
-                tracing::debug!("using docker credentials for {server}");
-                return RegistryAuth::Basic(user, pass);
-            }
-            Ok(docker_credential::DockerCredential::IdentityToken(token)) => {
-                tracing::debug!("using docker identity token for {server}");
-                return RegistryAuth::Bearer(token);
-            }
-            Err(e) => tracing::trace!("no docker credential for {server}: {e}"),
-        }
-    }
-    RegistryAuth::Anonymous
-}
-
 /// Map registry media types (docker or OCI) to the OCI media types used in the layout.
 pub fn layer_media_type(media_type: &str) -> Result<MediaType> {
     Ok(match media_type {
@@ -124,7 +95,6 @@ pub async fn fetch_base_image(
     let reference: Reference = image
         .parse()
         .with_context(|| format!("invalid base image reference `{image}`"))?;
-    let auth = registry_auth(&reference);
 
     let resolver_platform = platform.clone();
     let client = Client::new(ClientConfig {
@@ -150,7 +120,7 @@ pub async fn fetch_base_image(
             .unwrap_or_default()
     );
     let (manifest, _digest, config_json) = client
-        .pull_manifest_and_config(&reference, &auth)
+        .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
         .await
         .with_context(|| {
             format!(

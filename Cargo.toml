@@ -33,7 +33,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 clap = { version = "4.6", features = ["derive", "string", "env"] }
 clap-verbosity-flag = { version = "3.0", features = ["tracing"] }
 clap_complete = "4.6"
-docker_credential = "1.4"
 flate2 = "1.1"
 futures = "0.3"
 indicatif = "0.18"

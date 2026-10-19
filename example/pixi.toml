@@ -11,6 +11,7 @@ numpy = "*"
 requests = ">=2.34.2,<3"
 
 [tool.pixi-oci]
+name = "example-project"
 base = { shadow-setup = true, glibc = "2.41-12+deb13u4" }
 copy-to-image = [
   "my-file",
