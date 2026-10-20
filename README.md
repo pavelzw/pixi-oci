@@ -124,5 +124,3 @@ pixi run test
 pixi run pre-commit-run
 pixi run example
 ```
-
-The linters are not available for `linux-riscv64`. There, use the `build` environment, e.g. `pixi run -e build test`.

@@ -49,12 +49,9 @@ jobs:
           persist-credentials: false
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
-        with:
-          # The default environment's linters are not available for linux-riscv64.
-          environments: build
       # The integration tests need network access (conda-forge, Docker Hub, snapshot.debian.org).
       # The docker and skopeo tests run only where those tools are installed.
       - name: Run tests
-        run: pixi run -e build test
+        run: pixi run test
         env:
           CARGO_TERM_COLOR: always
