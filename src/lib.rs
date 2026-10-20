@@ -417,6 +417,9 @@ mod tests {
         let arm = target_platform(Subdir::LinuxAarch64).unwrap();
         assert_eq!(arm.arch, Arch::ARM64);
         assert_eq!(arm.variant.as_deref(), Some("v8"));
+        let riscv = target_platform(Subdir::LinuxRiscv64).unwrap();
+        assert_eq!(riscv.arch, Arch::RISCV64);
+        assert_eq!(riscv.variant, None);
         assert!(target_platform(Subdir::OsxArm64).is_err());
     }
 }

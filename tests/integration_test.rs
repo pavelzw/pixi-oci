@@ -514,9 +514,14 @@ async fn docker_can_load_and_run(tmpdir: tempfile::TempDir) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
+    // The example is only locked for these linux platforms.
     let (subdir, oci_platform) = match host_arch.as_str() {
         "aarch64" | "arm64" => ("linux-aarch64", "linux/arm64"),
-        _ => ("linux-64", "linux/amd64"),
+        "x86_64" | "amd64" => ("linux-64", "linux/amd64"),
+        other => {
+            eprintln!("the example has no packages for docker's architecture {other}, skipping");
+            return;
+        }
     };
     let out = tmpdir.path().join("example.tar");
     build_example(&out, subdir, None, OutputFormat::OciTar).await;

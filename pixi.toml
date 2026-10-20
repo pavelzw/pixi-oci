@@ -2,19 +2,36 @@
 name = "pixi-oci"
 channels = ["conda-forge"]
 exclude-newer = "7d"
-platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+platforms = [
+  "osx-arm64",
+  "osx-64",
+  "linux-64",
+  "linux-aarch64",
+  "linux-riscv64",
+]
 
 [tasks]
 build = "cargo build --release"
 test = "cargo test"
 example = "cargo run -- build --manifest-path example"
-pre-commit-install = "pre-commit install"
-pre-commit-run = "pre-commit run -a"
 
 [dependencies]
 rust = "==1.98.1"
 openssl = "3.*"
 pkg-config = "*"
+
+[target.linux.dependencies]
+compilers = ">=1.7.0"
+
+# The linters are not available for linux-riscv64.
+[feature.lint]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[feature.lint.tasks]
+pre-commit-install = "pre-commit install"
+pre-commit-run = "pre-commit run -a"
+
+[feature.lint.dependencies]
 pre-commit = "*"
 prettier = "*"
 taplo = "*"
@@ -22,5 +39,7 @@ pre-commit-hooks = "*"
 typos = "*"
 shellcheck = "*"
 
-[target.linux.dependencies]
-compilers = ">=1.7.0"
+[environments]
+default = ["lint"]
+# Without the linters, for all platforms.
+build = []
