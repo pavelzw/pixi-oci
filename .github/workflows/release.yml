@@ -1,0 +1,143 @@
+name: Release
+# Keeps a `chore: release vX.Y.Z` pull request open that bumps the version and updates CHANGELOG.md
+# from the conventional commits since the last tag. Merging it publishes the crate and the GitHub release.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # Finds the commit that set Cargo.toml's version, unless that version is already tagged. It finds
+  # that commit rather than using HEAD, since a later push may have superseded the release commit's run.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find the untagged version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          # 0.0.0 is the placeholder before the first release.
+          if [ "$version" = 0.0.0 ] || git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "$tag needs no release."
+            exit 0
+          fi
+          sha=$(git log -1 --format=%H -G '^version = ' -- Cargo.toml)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  # Publishes the crate, then tags the commit and creates the GitHub release with its CHANGELOG.md
+  # section, which the release pull request generated.
+  release:
+    needs: version
+    if: needs.version.outputs.tag
+    runs-on: ubuntu-latest
+    # crates.io trusts this workflow in this environment.
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - name: Set up pixi
+        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - name: Obtain crates.io token
+        id: crates-io
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish to crates.io
+        run: pixi run cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        run: |
+          awk -v v="${TAG#v}" '/^## \[/ { p = index($0, "## [" v "]") == 1; next } p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --target "$SHA" --notes-file "$RUNNER_TEMP/notes.md"
+
+  pull-request:
+    needs: release
+    # Also runs when there was nothing to release.
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: git-cliff@2.14.2
+      - name: Determine the next version
+        id: version
+        run: |
+          latest=$(git describe --tags --abbrev=0 --match 'v*' 2> /dev/null || true)
+          next=$(git cliff --bumped-version)
+          if [ "$next" = "$latest" ]; then
+            echo "Nothing to release since $latest."
+            exit 0
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+      - name: Set up pixi
+        if: steps.version.outputs.next
+        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+      - name: Bump the version and update the changelog
+        if: steps.version.outputs.next
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          version="${NEXT#v}"
+          sed -i "0,/^version = \".*\"$/s//version = \"$version\"/" Cargo.toml
+          awk -v v="$version" '
+            /^name = "pixi-oci"$/ { print; getline; sub(/".*"/, "\"" v "\"") }
+            { print }
+          ' Cargo.lock > "$RUNNER_TEMP/Cargo.lock"
+          mv "$RUNNER_TEMP/Cargo.lock" Cargo.lock
+          git cliff --tag "$NEXT" -o CHANGELOG.md
+          pixi run prettier --write CHANGELOG.md
+          awk -v v="$version" '/^## \[/ { p = index($0, "## [" v "]") == 1; next } p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+      - name: Obtain GitHub app token
+        if: steps.version.outputs.next
+        id: octo-sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: release
+      - name: Open or update the release pull request
+        if: steps.version.outputs.next
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.octo-sts.outputs.token }}
+          branch: release
+          base: main
+          title: "chore: release ${{ steps.version.outputs.next }}"
+          commit-message: "chore: release ${{ steps.version.outputs.next }}"
+          body-path: ${{ runner.temp }}/notes.md
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
+            CHANGELOG.md
+          sign-commits: true

@@ -1,0 +1,23 @@
+[workspace]
+channels = ["conda-forge"]
+name = "example-project"
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+caddy = "*"
+polars = "*"
+pandas = "*"
+numpy = "*"
+requests = ">=2.34.2,<3"
+
+[tool.pixi-oci]
+tag = "example-project"
+base = { shadow-setup = true, glibc = "2.41-12+deb13u4" }
+copy-to-image = [
+  "my-file",
+  { source = "my-file2", destination = "/my-file-renamed" },
+]
+max-layers = 20
+[tool.pixi-oci.oci-config]
+# https://github.com/moby/docker-image-spec/blob/v1.3.1/spec.md#image-json-field-descriptions
+entrypoint = "caddy file-server --browse --root ."
