@@ -60,10 +60,6 @@ struct BuildArgs {
     /// A pixi/rattler config file with mirrors or authentication settings.
     #[arg(short, long)]
     config: Option<PathBuf>,
-
-    /// Cache directory for packages and base image layers (default: the rattler cache).
-    #[arg(long, env = "PIXI_OCI_CACHE_DIR")]
-    cache_dir: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -102,7 +98,6 @@ async fn main() -> Result<()> {
                 tag: args.tag,
                 base_image: args.base_image,
                 rattler_config: args.config,
-                cache_dir: args.cache_dir,
             })
             .await?;
             tracing::info!(

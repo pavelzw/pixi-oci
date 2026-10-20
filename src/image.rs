@@ -1,6 +1,6 @@
 //! Assembling the image config, manifest and index in an OCI layout directory.
 
-use std::{collections::HashMap, io::Write, path::Path};
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -10,7 +10,7 @@ use oci_spec::image::{
     ImageIndexBuilder, ImageManifest, ImageManifestBuilder, MediaType, Os, RootFsBuilder,
     SCHEMA_VERSION,
 };
-use ocidir::{OciDir, OciRead};
+use ocidir::OciDir;
 use serde::Serialize;
 
 use crate::{
@@ -103,7 +103,6 @@ pub struct AssembleInputs<'a> {
     pub output: &'a OciDir,
     pub output_dir: &'a Path,
     pub base: Option<&'a BaseImage>,
-    pub base_cache: &'a OciDir,
     pub layers: &'a [PlannedLayer],
     pub platform: &'a TargetPlatform,
     pub config: Config,
@@ -112,26 +111,15 @@ pub struct AssembleInputs<'a> {
     pub reference: &'a str,
 }
 
-/// Copy the base layers, write the new layers, then config, manifest and index.
+/// Reference the base layers (already in `output`), write the new layers, then config,
+/// manifest and index.
 pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
     let mut layer_descriptors: Vec<Descriptor> = Vec::new();
     let mut diff_ids: Vec<String> = Vec::new();
     let mut history = Vec::new();
 
     if let Some(base) = inputs.base {
-        for descriptor in &base.layers {
-            if !inputs.output.has_blob(descriptor)? {
-                let mut reader = inputs
-                    .base_cache
-                    .read_blob(descriptor)
-                    .context("could not read cached base layer")?;
-                let mut writer = inputs.output.create_blob()?;
-                std::io::copy(&mut reader, &mut writer)?;
-                writer.flush()?;
-                writer.complete_verified_as(descriptor)?;
-            }
-            layer_descriptors.push(descriptor.clone());
-        }
+        layer_descriptors.extend(base.layers.iter().cloned());
         diff_ids.extend(base.config.rootfs().diff_ids().iter().cloned());
         history.extend(base.config.history().clone().unwrap_or_default());
     }

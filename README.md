@@ -127,7 +127,7 @@ All layers are reproducible: entries are sorted, owned by root, and carry a fixe
 
 ### Caching
 
-Conda packages go into the regular rattler package cache, base image layers into `<cache>/pixi-oci/base-images` and Debian packages into `<cache>/pixi-oci/debian`. Override the root with `--cache-dir` or `PIXI_OCI_CACHE_DIR`. Mirrors and channel authentication are read from the usual rattler/pixi sources; pass `--config` to use a pixi config file with `mirrors` settings.
+Conda packages go into the regular rattler package cache shared with pixi (override with `RATTLER_CACHE_DIR`). Base image layers and Debian packages are not cached; they are downloaded on every build. Mirrors and channel authentication are read from the usual rattler/pixi sources; pass `--config` to use a pixi config file with `mirrors` settings.
 
 ## Limitations
 

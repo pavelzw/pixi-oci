@@ -63,8 +63,6 @@ pub struct BuildOptions {
     pub base_image: Option<String>,
     /// A rattler/pixi config file (mirrors, authentication).
     pub rattler_config: Option<PathBuf>,
-    /// Root cache directory (packages and base image layers).
-    pub cache_dir: Option<PathBuf>,
 }
 
 /// Summary of a finished build.
@@ -198,14 +196,35 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         check_glibc(&locked.records, glibc.as_ref())?;
     }
 
-    let cache_dir = match &options.cache_dir {
-        Some(dir) => dir.clone(),
-        None => rattler_cache::default_cache_dir()
-            .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?,
+    // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
+    let cache_dir = rattler_cache::default_cache_dir()
+        .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?;
+
+    // Decide where the layout goes. Base image layers are downloaded straight into it.
+    let default_output = match options.format {
+        OutputFormat::OciTar => PathBuf::from(format!("{}.tar", name.replace('/', "_"))),
+        OutputFormat::OciDir => PathBuf::from(name.replace('/', "_")),
     };
-    let base_cache_dir = cache_dir.join("pixi-oci").join("base-images");
-    let base_cache = OciDir::ensure(open_dir(&base_cache_dir)?)
-        .context("could not open the base image cache")?;
+    let output_path = options.output.clone().unwrap_or(default_output);
+    let to_stdout = output_path.as_os_str() == "-";
+    let layout_tmp;
+    let layout_dir: PathBuf = match options.format {
+        OutputFormat::OciDir => {
+            if to_stdout {
+                bail!("--format oci-dir cannot write to stdout");
+            }
+            output_path.clone()
+        }
+        OutputFormat::OciTar => {
+            layout_tmp = tempfile::Builder::new()
+                .prefix("pixi-oci-layout-")
+                .tempdir()
+                .context("could not create a temporary directory")?;
+            layout_tmp.path().to_path_buf()
+        }
+    };
+    let output_oci =
+        OciDir::ensure(open_dir(&layout_dir)?).context("could not create the output OCI layout")?;
 
     let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
     let client = reqwest_client_from_config(&rattler_config)?;
@@ -218,12 +237,12 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .context("could not create a temporary directory")?;
     let (base, rootfs_layers) = match &base_spec {
         BaseSpec::Image(image) => (
-            fetch_base_image(image, &platform, &base_cache).await?,
+            fetch_base_image(image, &platform, &output_oci).await?,
             Vec::new(),
         ),
         BaseSpec::Scratch(scratch) => (
             None,
-            plan_rootfs_layers(scratch, subdir, &client, &cache_dir, rootfs_staging.path()).await?,
+            plan_rootfs_layers(scratch, subdir, &client, rootfs_staging.path()).await?,
         ),
     };
 
@@ -294,37 +313,10 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         prepend_entrypoint(&mut merged, vec![activation_shell, wrapper]);
     }
 
-    // Decide where the layout goes.
-    let default_output = match options.format {
-        OutputFormat::OciTar => PathBuf::from(format!("{}.tar", name.replace('/', "_"))),
-        OutputFormat::OciDir => PathBuf::from(name.replace('/', "_")),
-    };
-    let output_path = options.output.clone().unwrap_or(default_output);
-    let to_stdout = output_path.as_os_str() == "-";
-    let layout_tmp;
-    let layout_dir: PathBuf = match options.format {
-        OutputFormat::OciDir => {
-            if to_stdout {
-                bail!("--format oci-dir cannot write to stdout");
-            }
-            output_path.clone()
-        }
-        OutputFormat::OciTar => {
-            layout_tmp = tempfile::Builder::new()
-                .prefix("pixi-oci-layout-")
-                .tempdir()
-                .context("could not create a temporary directory")?;
-            layout_tmp.path().to_path_buf()
-        }
-    };
-    let output_oci =
-        OciDir::ensure(open_dir(&layout_dir)?).context("could not create the output OCI layout")?;
-
     let assembled = assemble_image(AssembleInputs {
         output: &output_oci,
         output_dir: &layout_dir,
         base: base.as_ref(),
-        base_cache: &base_cache,
         layers: &layers,
         platform: &platform,
         config: merged,

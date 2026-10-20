@@ -1,4 +1,4 @@
-//! Pulling the base image from a registry into a local OCI layout cache.
+//! Pulling the base image from a registry into the output OCI layout.
 
 use std::{io::Write, str::FromStr};
 
@@ -17,7 +17,7 @@ use ocidir::{OciDir, OciRead};
 
 use crate::config::SCRATCH;
 
-/// A base image whose layers are available in the cache directory.
+/// A base image whose layers are available in the output layout.
 #[derive(Debug)]
 pub struct BaseImage {
     pub reference: Reference,
@@ -82,12 +82,12 @@ fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
         .build()?)
 }
 
-/// Pull the manifest, config and layers of `image` for `platform` into `cache`.
+/// Pull the manifest, config and layers of `image` for `platform` into `output`.
 /// Returns `None` for `scratch`.
 pub async fn fetch_base_image(
     image: &str,
     platform: &TargetPlatform,
-    cache: &OciDir,
+    output: &OciDir,
 ) -> Result<Option<BaseImage>> {
     if image == SCRATCH {
         return Ok(None);
@@ -144,10 +144,10 @@ pub async fn fetch_base_image(
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
         let descriptor = to_oci_descriptor(layer)?;
-        if cache.has_blob(&descriptor)? {
-            tracing::debug!("base layer {} already cached", layer.digest);
+        if output.has_blob(&descriptor)? {
+            tracing::debug!("base layer {} already present", layer.digest);
         } else {
-            download_blob(&client, &reference, layer, &descriptor, cache).await?;
+            download_blob(&client, &reference, layer, &descriptor, output).await?;
         }
         layers.push(descriptor);
     }
@@ -164,7 +164,7 @@ async fn download_blob(
     reference: &Reference,
     layer: &OciDescriptor,
     descriptor: &Descriptor,
-    cache: &OciDir,
+    output: &OciDir,
 ) -> Result<()> {
     let mut stream = client
         .pull_blob_stream(reference, layer)
@@ -180,7 +180,7 @@ async fn download_blob(
     );
     progress.set_message(short_digest(&layer.digest));
 
-    let mut writer = cache.create_blob()?;
+    let mut writer = output.create_blob()?;
     while let Some(chunk) = stream.stream.next().await {
         let chunk = chunk.with_context(|| format!("error while downloading {}", layer.digest))?;
         writer.write_all(&chunk)?;

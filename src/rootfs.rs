@@ -124,7 +124,6 @@ pub async fn plan_rootfs_layers(
     base: &ScratchBase,
     subdir: Subdir,
     client: &ClientWithMiddleware,
-    cache_dir: &Path,
     staging: &Path,
 ) -> Result<Vec<PlannedLayer>> {
     let mut layers = Vec::new();
@@ -132,9 +131,7 @@ pub async fn plan_rootfs_layers(
         let arch = debian_arch(subdir)?;
         let deb: Cow<'static, [u8]> = match bundled_deb("libc6", version, arch) {
             Some(deb) => Cow::Borrowed(deb),
-            None => Cow::Owned(fs::read(
-                fetch_deb(client, cache_dir, "libc6", version, arch).await?,
-            )?),
+            None => Cow::Owned(fetch_deb(client, "libc6", version, arch).await?),
         };
         let root = staging.join("glibc");
         extract_deb(&deb, &root, keep_glibc_file)
@@ -247,23 +244,14 @@ struct BinFile {
     hash: String,
 }
 
-/// Download `<package>_<version>_<arch>.deb` from snapshot.debian.org into the cache, verified
-/// against the SHA-1 the archive addresses it by. Returns the cached path.
+/// Download `<package>_<version>_<arch>.deb` from snapshot.debian.org, verified against the
+/// SHA-1 the archive addresses it by.
 async fn fetch_deb(
     client: &ClientWithMiddleware,
-    cache_dir: &Path,
     package: &str,
     version: &str,
     arch: &str,
-) -> Result<PathBuf> {
-    let dir = cache_dir.join("pixi-oci").join("debian");
-    let path = dir.join(format!(
-        "{package}_{}_{arch}.deb",
-        version.replace(':', "%3a")
-    ));
-    if path.is_file() {
-        return Ok(path);
-    }
+) -> Result<Vec<u8>> {
     eprintln!("⬇️  Downloading {package} {version} ({arch}) from snapshot.debian.org");
 
     let url = format!("{SNAPSHOT_URL}/mr/binary/{package}/{version}/binfiles");
@@ -302,13 +290,7 @@ async fn fetch_deb(
     if actual != hash {
         bail!("checksum mismatch for {package} {version}: expected {hash}, got {actual}");
     }
-
-    fs::create_dir_all(&dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
-    std::io::Write::write_all(&mut tmp, &data)?;
-    tmp.persist(&path)
-        .with_context(|| format!("could not write {}", path.display()))?;
-    Ok(path)
+    Ok(data.to_vec())
 }
 
 /// Unpack the `data.tar.xz` of a `.deb` into `dest`, keeping only the paths `keep` accepts.
