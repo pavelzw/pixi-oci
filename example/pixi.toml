@@ -1,7 +1,13 @@
 [workspace]
 channels = ["conda-forge"]
 name = "example-project"
-platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+platforms = [
+  "osx-arm64",
+  "linux-64",
+  "linux-aarch64",
+  "linux-ppc64le",
+  "linux-riscv64",
+]
 
 [dependencies]
 caddy = "*"
