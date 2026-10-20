@@ -26,6 +26,28 @@ pub fn blob_path(digest: &str) -> String {
     format!("blobs/sha256/{hex}")
 }
 
+/// Delete every blob in the layout that is not in `keep` (`sha256:<hex>` digests), e.g. the
+/// leftovers of an earlier build into the same directory. Returns how many were removed.
+pub fn prune_blobs(layout_dir: &Path, keep: &[&str]) -> Result<usize> {
+    let keep: Vec<&str> = keep
+        .iter()
+        .map(|d| d.strip_prefix("sha256:").unwrap_or(d))
+        .collect();
+    let blobs = layout_dir.join("blobs/sha256");
+    let mut removed = 0;
+    for entry in
+        std::fs::read_dir(&blobs).with_context(|| format!("could not read {}", blobs.display()))?
+    {
+        let entry = entry?;
+        if !keep.contains(&entry.file_name().to_string_lossy().as_ref()) {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("could not remove {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Write `manifest.json` into the layout directory.
 pub fn write_docker_manifest(layout_dir: &Path, entry: &DockerManifestEntry) -> Result<()> {
     let contents = serde_json::to_vec(&[entry])?;

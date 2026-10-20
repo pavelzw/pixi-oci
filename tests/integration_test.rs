@@ -425,6 +425,14 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
         config.config.env[0],
         format!("PATH=/opt/env/bin:{}", pixi_oci::activation::DEFAULT_PATH)
     );
+
+    // Rebuilding into the same directory drops the blobs of the earlier build.
+    let report = build_example(&out, "linux-64", Some("scratch"), OutputFormat::OciDir).await;
+    let index: Index = serde_json::from_slice(&fs::read(out.join("index.json")).unwrap()).unwrap();
+    let manifest: Manifest = serde_json::from_slice(&blob(&index.manifests[0].digest)).unwrap();
+    assert_eq!(manifest.layers.len(), report.package_layers + 1);
+    let blobs = fs::read_dir(out.join("blobs/sha256")).unwrap().count();
+    assert_eq!(blobs, manifest.layers.len() + 2);
 }
 
 #[rstest]

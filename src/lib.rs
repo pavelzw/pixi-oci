@@ -24,7 +24,10 @@ use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
 
 use crate::{
     activation::{ActivationInputs, prepare_activation},
-    archive::{DockerManifestEntry, Output, blob_path, write_docker_manifest, write_oci_archive},
+    archive::{
+        DockerManifestEntry, Output, blob_path, prune_blobs, write_docker_manifest,
+        write_oci_archive,
+    },
     base_image::{TargetPlatform, fetch_base_image},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
@@ -329,6 +332,22 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 
     let output = match options.format {
         OutputFormat::OciDir => {
+            // index.json only references this build, so blobs of earlier builds are garbage.
+            let keep: Vec<&str> = [&manifest_digest, &config_digest]
+                .into_iter()
+                .map(String::as_str)
+                .chain(
+                    assembled
+                        .manifest
+                        .layers()
+                        .iter()
+                        .map(|l| l.digest().as_ref()),
+                )
+                .collect();
+            let removed = prune_blobs(&layout_dir, &keep)?;
+            if removed > 0 {
+                tracing::info!("removed {removed} blobs of earlier builds");
+            }
             eprintln!("✅ Wrote OCI layout to {}", output_path.display());
             Some(output_path)
         }
