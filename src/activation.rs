@@ -1,0 +1,241 @@
+//! Environment activation inside the image: static environment variables in the image config
+//! plus a small wrapper that sources the `activate.d` scripts before running the command.
+
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result};
+use rattler_conda_types::Subdir;
+use rattler_shell::{
+    activation::{Activator, prefix_path_entries},
+    shell::Bash,
+};
+
+/// Default `PATH` when neither the base image nor the user define one.
+pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Location of the generated wrapper, relative to the install prefix.
+pub const WRAPPER_RELATIVE_PATH: &str = "etc/pixi-oci/entrypoint.sh";
+
+/// What the image needs to activate the environment.
+#[derive(Debug)]
+pub struct Activation {
+    /// `KEY=VALUE` entries for the image config.
+    pub env: Vec<String>,
+    /// Absolute in-image path of the wrapper script, if any activation scripts exist.
+    pub wrapper: Option<String>,
+}
+
+/// Inputs for computing the activation.
+pub struct ActivationInputs<'a> {
+    /// The staging prefix on the host.
+    pub staging_prefix: &'a Path,
+    /// The prefix path inside the image.
+    pub install_prefix: &'a str,
+    pub subdir: Subdir,
+    /// `Env` of the base image.
+    pub base_env: &'a [(String, String)],
+    /// `env` from `[tool.pixi-oci.oci-config]`.
+    pub user_env: &'a [(String, String)],
+}
+
+/// Ordered environment with "last write wins" semantics that keeps the original position.
+#[derive(Default)]
+struct OrderedEnv(Vec<(String, String)>);
+
+impl OrderedEnv {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => self.0.push((key, value)),
+        }
+    }
+
+    fn into_strings(self) -> Vec<String> {
+        self.0
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect()
+    }
+}
+
+/// Compute the environment variables and, when needed, write the wrapper script into the
+/// staging prefix.
+pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
+    let activator = Activator::from_path(inputs.staging_prefix, Bash::default(), inputs.subdir)
+        .context("could not inspect the environment for activation scripts")?;
+
+    let mut env = OrderedEnv::default();
+    for (k, v) in inputs.base_env {
+        env.set(k.clone(), v.clone());
+    }
+
+    let prefix_paths: Vec<String> =
+        prefix_path_entries(Path::new(inputs.install_prefix), &inputs.subdir)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+    let base_path = env.get("PATH").unwrap_or(DEFAULT_PATH).to_string();
+    env.set("PATH", format!("{}:{}", prefix_paths.join(":"), base_path));
+    env.set("CONDA_PREFIX", inputs.install_prefix);
+
+    for (k, v) in &activator.env_vars {
+        env.set(k.clone(), v.clone());
+    }
+    for (k, v) in inputs.user_env {
+        warn_if_unexpanded(k, v);
+        env.set(k.clone(), v.clone());
+    }
+
+    let wrapper = if activator.activation_scripts.is_empty() {
+        None
+    } else {
+        let scripts: Vec<String> = activator
+            .activation_scripts
+            .iter()
+            .map(|script| rebase(script, inputs.staging_prefix, inputs.install_prefix))
+            .collect::<Result<_>>()?;
+        let wrapper_image_path = format!("{}/{WRAPPER_RELATIVE_PATH}", inputs.install_prefix);
+        let wrapper_host_path = inputs.staging_prefix.join(WRAPPER_RELATIVE_PATH);
+        write_wrapper(&wrapper_host_path, &scripts)?;
+        Some(wrapper_image_path)
+    };
+
+    Ok(Activation {
+        env: env.into_strings(),
+        wrapper,
+    })
+}
+
+/// The image config holds literal values; unlike `pixi shell-hook`, no shell expands
+/// references such as `$CONDA_PREFIX` or `$PATH`.
+fn warn_if_unexpanded(key: &str, value: &str) {
+    if value.contains('$') {
+        tracing::warn!(
+            "environment variable {key}={value} contains `$`, which is not expanded in the image"
+        );
+    }
+}
+
+fn rebase(script: &Path, staging_prefix: &Path, install_prefix: &str) -> Result<String> {
+    let rel = script.strip_prefix(staging_prefix).with_context(|| {
+        format!(
+            "activation script {} is outside the prefix",
+            script.display()
+        )
+    })?;
+    Ok(format!("{install_prefix}/{}", rel.to_string_lossy()))
+}
+
+/// Render the wrapper script contents.
+pub fn render_wrapper(scripts: &[String]) -> String {
+    let mut out = String::from(
+        "#!/bin/sh\n# Generated by pixi-oci. Sources the activation scripts of the environment,\n# then runs the command passed to the container.\n",
+    );
+    for script in scripts {
+        out.push_str(&format!(
+            ". {}\n",
+            shlex::try_quote(script).unwrap_or(script.into())
+        ));
+    }
+    out.push_str("exec \"$@\"\n");
+    out
+}
+
+fn write_wrapper(path: &PathBuf, scripts: &[String]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, render_wrapper(scripts))
+        .with_context(|| format!("could not write {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_env_overrides_in_place() {
+        let mut env = OrderedEnv::default();
+        env.set("A", "1");
+        env.set("B", "2");
+        env.set("A", "3");
+        assert_eq!(env.into_strings(), vec!["A=3", "B=2"]);
+    }
+
+    #[test]
+    fn wrapper_sources_scripts_then_execs() {
+        let script = render_wrapper(&["/opt/env/etc/conda/activate.d/a.sh".to_string()]);
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains(". /opt/env/etc/conda/activate.d/a.sh\n"));
+        assert!(script.ends_with("exec \"$@\"\n"));
+    }
+
+    #[test]
+    fn computes_env_for_prefix_without_scripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("bin")).unwrap();
+        let activation = prepare_activation(ActivationInputs {
+            staging_prefix: tmp.path(),
+            install_prefix: "/opt/env",
+            subdir: Subdir::Linux64,
+            base_env: &[
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("LANG".to_string(), "C".to_string()),
+            ],
+            user_env: &[("LANG".to_string(), "C.UTF-8".to_string())],
+        })
+        .unwrap();
+        assert_eq!(
+            activation.env,
+            vec![
+                "PATH=/opt/env/bin:/usr/bin",
+                "LANG=C.UTF-8",
+                "CONDA_PREFIX=/opt/env"
+            ]
+        );
+        assert!(activation.wrapper.is_none());
+    }
+
+    #[test]
+    fn writes_wrapper_when_scripts_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let activate_d = tmp.path().join("etc/conda/activate.d");
+        fs::create_dir_all(&activate_d).unwrap();
+        fs::write(activate_d.join("b.sh"), "export B=1\n").unwrap();
+        fs::write(activate_d.join("a.sh"), "export A=1\n").unwrap();
+        let activation = prepare_activation(ActivationInputs {
+            staging_prefix: tmp.path(),
+            install_prefix: "/opt/env",
+            subdir: Subdir::Linux64,
+            base_env: &[],
+            user_env: &[],
+        })
+        .unwrap();
+        assert_eq!(
+            activation.wrapper.as_deref(),
+            Some("/opt/env/etc/pixi-oci/entrypoint.sh")
+        );
+        let contents = fs::read_to_string(tmp.path().join(WRAPPER_RELATIVE_PATH)).unwrap();
+        let a = contents.find("activate.d/a.sh").unwrap();
+        let b = contents.find("activate.d/b.sh").unwrap();
+        assert!(a < b, "scripts must be sourced in sorted order");
+        assert_eq!(
+            activation.env[0],
+            format!("PATH=/opt/env/bin:{DEFAULT_PATH}")
+        );
+    }
+}
