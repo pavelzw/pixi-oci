@@ -35,7 +35,10 @@ use crate::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
         DEFAULT_TAG, LoadedManifest,
     },
-    image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
+    image::{
+        AssembleInputs, assemble_image, created_timestamp, merge_config, merge_docker_extensions,
+        prepend_entrypoint,
+    },
     install::{install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
@@ -299,6 +302,10 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     if let Some(wrapper) = activation.wrapper {
         prepend_entrypoint(&mut merged, vec![activation_shell, wrapper]);
     }
+    let docker_extensions = merge_docker_extensions(
+        base.as_ref().map(|b| &b.docker_extensions),
+        &cfg.oci_config.to_docker_extensions()?,
+    );
 
     let assembled = assemble_image(AssembleInputs {
         output: &output_oci,
@@ -307,6 +314,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         layers: &layers,
         platform: &platform,
         config: merged,
+        docker_extensions,
         created: created_timestamp(),
         reference: &reference,
         normalized_reference: &normalized_reference,

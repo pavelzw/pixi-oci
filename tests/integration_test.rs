@@ -461,6 +461,47 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
 }
 
 #[rstest]
+#[tokio::test]
+async fn writes_healthcheck_and_shell(tmpdir: tempfile::TempDir) {
+    let project = example_with_base(tmpdir.path(), "scratch");
+    let mut manifest = fs::read_to_string(project.join("pixi.toml")).unwrap();
+    manifest.push_str(
+        r#"shell = ["/opt/env/bin/bash", "-c"]
+[tool.pixi-oci.oci-config.healthcheck]
+test = ["caddy", "version"]
+interval = "30s"
+retries = 3
+"#,
+    );
+    fs::write(project.join("pixi.toml"), manifest).unwrap();
+    let out = tmpdir.path().join("image.tar");
+    pixi_oci::build(BuildOptions {
+        manifest_path: project,
+        platform: Some("linux-64".to_string()),
+        output: Some(out.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+
+    let archive = Archive::open(&out);
+    let config: serde_json::Value =
+        serde_json::from_slice(archive.blob(&archive.manifest().config.digest)).unwrap();
+    assert_eq!(
+        config["config"]["Healthcheck"],
+        serde_json::json!({
+            "Test": ["CMD", "caddy", "version"],
+            "Interval": 30_000_000_000_i64,
+            "Retries": 3,
+        })
+    );
+    assert_eq!(
+        config["config"]["Shell"],
+        serde_json::json!(["/opt/env/bin/bash", "-c"])
+    );
+}
+
+#[rstest]
 fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
     let project = example_with_base(tmpdir.path(), "scratch");
     let mut digests = Vec::new();

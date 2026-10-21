@@ -15,7 +15,7 @@ use oci_spec::image::{
 };
 use ocidir::{OciDir, OciRead};
 
-use crate::config::SCRATCH;
+use crate::config::{DockerConfigExtensions, SCRATCH};
 
 /// A base image whose layers are available in the output layout.
 #[derive(Debug)]
@@ -24,6 +24,19 @@ pub struct BaseImage {
     /// Layer descriptors with OCI media types, in order.
     pub layers: Vec<Descriptor>,
     pub config: ImageConfiguration,
+    /// `Healthcheck` and `Shell` of the config, which [`ImageConfiguration`] drops.
+    pub docker_extensions: DockerConfigExtensions,
+}
+
+/// Parse the docker-specific fields from a raw image config.
+fn parse_docker_extensions(config_json: &str) -> Result<DockerConfigExtensions> {
+    #[derive(serde::Deserialize)]
+    struct RawImageConfig {
+        #[serde(default)]
+        config: Option<DockerConfigExtensions>,
+    }
+    let raw: RawImageConfig = serde_json::from_str(config_json)?;
+    Ok(raw.config.unwrap_or_default())
 }
 
 /// The target platform of the image.
@@ -131,6 +144,8 @@ pub async fn fetch_base_image(
         })?;
     let config = ImageConfiguration::from_reader(config_json.as_bytes())
         .context("could not parse the base image config")?;
+    let docker_extensions =
+        parse_docker_extensions(&config_json).context("could not parse the base image config")?;
     if config.os() != &Os::Linux || config.architecture() != &platform.arch {
         bail!(
             "base image {} is {}/{} but the build targets linux/{}",
@@ -156,6 +171,7 @@ pub async fn fetch_base_image(
         reference,
         layers,
         config,
+        docker_extensions,
     }))
 }
 
@@ -201,6 +217,30 @@ fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_docker_extensions_of_base_config() {
+        let ext = parse_docker_extensions(
+            r#"{"architecture":"amd64","os":"linux","config":{"Env":["A=1"],
+            "Healthcheck":{"Test":["CMD-SHELL","true"],"Interval":30000000000},
+            "Shell":["/bin/sh","-c"]},"rootfs":{"type":"layers","diff_ids":[]}}"#,
+        )
+        .unwrap();
+        let healthcheck = ext.healthcheck.unwrap();
+        assert_eq!(
+            healthcheck.test.as_deref(),
+            Some(&["CMD-SHELL".to_string(), "true".to_string()][..])
+        );
+        assert_eq!(healthcheck.interval, Some(30_000_000_000));
+        assert_eq!(
+            ext.shell.as_deref(),
+            Some(&["/bin/sh".to_string(), "-c".to_string()][..])
+        );
+        assert_eq!(
+            parse_docker_extensions(r#"{"config":null}"#).unwrap(),
+            DockerConfigExtensions::default()
+        );
+    }
 
     #[test]
     fn maps_docker_layer_types_to_oci() {

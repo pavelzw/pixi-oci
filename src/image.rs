@@ -15,6 +15,7 @@ use serde::Serialize;
 
 use crate::{
     base_image::{BaseImage, TargetPlatform},
+    config::DockerConfigExtensions,
     layers::{PlannedLayer, write_layer},
 };
 
@@ -80,6 +81,19 @@ pub fn merge_config(base: Option<&Config>, overlay: &Config) -> Config {
     merged
 }
 
+/// Merge the docker-specific config fields: like `HEALTHCHECK` and `SHELL` in a Dockerfile,
+/// fields set in `overlay` replace the inherited ones.
+pub fn merge_docker_extensions(
+    base: Option<&DockerConfigExtensions>,
+    overlay: &DockerConfigExtensions,
+) -> DockerConfigExtensions {
+    let base = base.cloned().unwrap_or_default();
+    DockerConfigExtensions {
+        healthcheck: overlay.healthcheck.clone().or(base.healthcheck),
+        shell: overlay.shell.clone().or(base.shell),
+    }
+}
+
 /// `base` followed by the entries of `extra` not already in it; `None` when empty.
 fn union(base: &Option<Vec<String>>, extra: &Option<Vec<String>>) -> Option<Vec<String>> {
     let mut out = base.clone().unwrap_or_default();
@@ -106,6 +120,8 @@ pub struct AssembleInputs<'a> {
     pub layers: &'a [PlannedLayer],
     pub platform: &'a TargetPlatform,
     pub config: Config,
+    /// Docker-specific fields added to `config`.
+    pub docker_extensions: DockerConfigExtensions,
     pub created: DateTime<Utc>,
     /// `name:tag` as the user wrote it.
     pub reference: &'a str,
@@ -161,7 +177,8 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
         config_builder = config_builder.variant(variant.clone());
     }
     let image_config: ImageConfiguration = config_builder.build()?;
-    let config_descriptor = inputs.output.write_config(image_config)?;
+    let config_descriptor =
+        write_image_config(inputs.output, &image_config, &inputs.docker_extensions)?;
 
     let manifest = ImageManifestBuilder::default()
         .schema_version(SCHEMA_VERSION)
@@ -206,6 +223,40 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
         manifest_descriptor,
         config_descriptor,
     })
+}
+
+/// The image config JSON: `image_config` with `extensions` added to its `config` object.
+fn image_config_json(
+    image_config: &ImageConfiguration,
+    extensions: &DockerConfigExtensions,
+) -> Result<serde_json::Value> {
+    let mut json = serde_json::to_value(image_config)?;
+    let serde_json::Value::Object(extra) = serde_json::to_value(extensions)? else {
+        unreachable!("DockerConfigExtensions serializes to an object");
+    };
+    if !extra.is_empty() {
+        let config = json
+            .as_object_mut()
+            .context("image config is not an object")?
+            .entry("config")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        config
+            .as_object_mut()
+            .context("image config `config` is not an object")?
+            .extend(extra);
+    }
+    Ok(json)
+}
+
+fn write_image_config(
+    output: &OciDir,
+    image_config: &ImageConfiguration,
+    extensions: &DockerConfigExtensions,
+) -> Result<Descriptor> {
+    let json = image_config_json(image_config, extensions)?;
+    Ok(output
+        .write_json_blob(&json, MediaType::ImageConfig)?
+        .build()?)
 }
 
 #[cfg(test)]
@@ -259,6 +310,65 @@ mod tests {
             merged.exposed_ports().as_deref(),
             Some(&["80/tcp".to_string(), "8080/tcp".to_string()][..])
         );
+    }
+
+    #[test]
+    fn docker_extensions_are_inherited_or_replaced() {
+        use crate::config::HealthConfig;
+
+        let base = DockerConfigExtensions {
+            healthcheck: Some(HealthConfig {
+                test: Some(vec!["CMD".into(), "base".into()]),
+                ..Default::default()
+            }),
+            shell: Some(vec!["/bin/sh".into(), "-c".into()]),
+        };
+        let overlay = DockerConfigExtensions {
+            shell: Some(vec!["/bin/bash".into(), "-c".into()]),
+            ..Default::default()
+        };
+        let merged = merge_docker_extensions(Some(&base), &overlay);
+        assert_eq!(merged.healthcheck, base.healthcheck);
+        assert_eq!(merged.shell, overlay.shell);
+    }
+
+    #[test]
+    fn docker_extensions_are_added_to_the_config_json() {
+        use crate::config::HealthConfig;
+
+        let image_config = ImageConfigurationBuilder::default()
+            .architecture(oci_spec::image::Arch::Amd64)
+            .os(Os::Linux)
+            .config(base())
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(Vec::<String>::new())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let plain = image_config_json(&image_config, &Default::default()).unwrap();
+        assert_eq!(plain, serde_json::to_value(&image_config).unwrap());
+
+        let extensions = DockerConfigExtensions {
+            healthcheck: Some(HealthConfig {
+                test: Some(vec!["NONE".into()]),
+                ..Default::default()
+            }),
+            shell: Some(vec!["/bin/sh".into(), "-c".into()]),
+        };
+        let json = image_config_json(&image_config, &extensions).unwrap();
+        assert_eq!(
+            json["config"]["Healthcheck"],
+            serde_json::json!({ "Test": ["NONE"] })
+        );
+        assert_eq!(
+            json["config"]["Shell"],
+            serde_json::json!(["/bin/sh", "-c"])
+        );
+        assert_eq!(json["config"]["WorkingDir"], "/base");
     }
 
     #[test]
