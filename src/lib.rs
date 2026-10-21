@@ -7,6 +7,7 @@
 pub mod activation;
 pub mod archive;
 pub mod base_image;
+pub mod cleanup;
 pub mod config;
 pub mod image;
 pub mod install;
@@ -29,6 +30,7 @@ use crate::{
         write_oci_archive,
     },
     base_image::{TargetPlatform, fetch_base_image},
+    cleanup::{PartialFile, TempDir},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
         DEFAULT_TAG, LoadedManifest,
@@ -206,10 +208,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             output_path.clone()
         }
         OutputFormat::OciTar => {
-            layout_tmp = tempfile::Builder::new()
-                .prefix("pixi-oci-layout-")
-                .tempdir()
-                .context("could not create a temporary directory")?;
+            layout_tmp = TempDir::new("pixi-oci-layout-")?;
             layout_tmp.path().to_path_buf()
         }
     };
@@ -221,10 +220,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 
     // Fetch the base while nothing else needs the network heavily: pull the registry image, or
     // assemble the root filesystem for a scratch base.
-    let rootfs_staging = tempfile::Builder::new()
-        .prefix("pixi-oci-rootfs-")
-        .tempdir()
-        .context("could not create a temporary directory")?;
+    let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match &base_spec {
         BaseSpec::Image(image) => (
             fetch_base_image(image, &platform, &output_oci).await?,
@@ -237,10 +233,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     };
 
     // Install the environment into a staging directory mirroring the in-image layout.
-    let staging = tempfile::Builder::new()
-        .prefix("pixi-oci-")
-        .tempdir()
-        .context("could not create a temporary directory")?;
+    let staging = TempDir::new("pixi-oci-")?;
     let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
     std::fs::create_dir_all(&staging_prefix)?;
     let packages = locked.records.len();
@@ -362,7 +355,11 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             } else {
                 Output::File(output_path.clone())
             };
+            let partial = (!to_stdout).then(|| PartialFile::new(output_path.clone()));
             let bytes = write_oci_archive(&layout_dir, &destination)?;
+            if let Some(partial) = partial {
+                partial.keep();
+            }
             if to_stdout {
                 eprintln!("✅ Wrote {reference} ({bytes} bytes) to stdout");
                 None
