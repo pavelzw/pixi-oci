@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Config;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Default location of the environment inside the image.
 pub const DEFAULT_INSTALL_PREFIX: &str = "/opt/env";
@@ -213,6 +213,8 @@ pub struct OciConfigSection {
     #[serde(default)]
     pub volumes: Vec<String>,
     pub stop_signal: Option<String>,
+    pub healthcheck: Option<HealthcheckSpec>,
+    pub shell: Option<StringOrVec>,
 }
 
 impl OciConfigSection {
@@ -258,6 +260,159 @@ impl OciConfigSection {
         config.set_stop_signal(self.stop_signal.clone());
         Ok(config)
     }
+
+    /// The docker-specific config fields that [`Config`] has no room for.
+    pub fn to_docker_extensions(&self) -> Result<DockerConfigExtensions> {
+        let shell = self
+            .shell
+            .as_ref()
+            .map(|shell| {
+                let argv = shell.to_argv()?;
+                if argv.is_empty() {
+                    bail!("oci-config.shell must not be empty");
+                }
+                Ok(argv)
+            })
+            .transpose()?;
+        Ok(DockerConfigExtensions {
+            healthcheck: self
+                .healthcheck
+                .as_ref()
+                .map(HealthcheckSpec::to_health_config)
+                .transpose()
+                .context("invalid oci-config.healthcheck")?,
+            shell,
+        })
+    }
+}
+
+/// `[tool.pixi-oci.oci-config.healthcheck]`, like `HEALTHCHECK` in a Dockerfile.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HealthcheckSpec {
+    /// A string runs through the image's shell (`CMD-SHELL`), a list is executed directly
+    /// (`CMD`). Lists starting with `CMD`, `CMD-SHELL` or `NONE` are taken as they are, so
+    /// `["NONE"]` disables a healthcheck inherited from the base image.
+    pub test: StringOrVec,
+    pub interval: Option<DurationSpec>,
+    pub timeout: Option<DurationSpec>,
+    pub start_period: Option<DurationSpec>,
+    pub start_interval: Option<DurationSpec>,
+    pub retries: Option<u32>,
+}
+
+impl HealthcheckSpec {
+    pub fn to_health_config(&self) -> Result<HealthConfig> {
+        let test = match &self.test {
+            StringOrVec::String(cmd) => vec!["CMD-SHELL".to_string(), cmd.clone()],
+            StringOrVec::Vec(argv) => match argv.first().map(String::as_str) {
+                None => bail!("`test` must not be empty"),
+                Some("CMD" | "CMD-SHELL" | "NONE") => argv.clone(),
+                Some(_) => std::iter::once("CMD".to_string())
+                    .chain(argv.iter().cloned())
+                    .collect(),
+            },
+        };
+        let nanos = |name: &str, d: &Option<DurationSpec>| -> Result<Option<i64>> {
+            d.as_ref()
+                .map(|d| d.to_nanos().with_context(|| format!("invalid `{name}`")))
+                .transpose()
+        };
+        Ok(HealthConfig {
+            test: Some(test),
+            interval: nanos("interval", &self.interval)?,
+            timeout: nanos("timeout", &self.timeout)?,
+            start_period: nanos("start-period", &self.start_period)?,
+            start_interval: nanos("start-interval", &self.start_interval)?,
+            retries: self.retries,
+        })
+    }
+}
+
+/// A duration given as a Go-style string (`"30s"`, `"1m30s"`, `"500ms"`) or in seconds.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum DurationSpec {
+    Seconds(u32),
+    String(String),
+}
+
+impl DurationSpec {
+    /// The duration in nanoseconds; docker requires at least one millisecond.
+    pub fn to_nanos(&self) -> Result<i64> {
+        let nanos = match self {
+            DurationSpec::Seconds(s) => i64::from(*s) * 1_000_000_000,
+            DurationSpec::String(s) => parse_duration_nanos(s)?,
+        };
+        if nanos < 1_000_000 {
+            bail!("duration must be at least 1ms");
+        }
+        Ok(nanos)
+    }
+}
+
+/// Parse a Go duration such as `"1h2m3.5s"` into nanoseconds.
+fn parse_duration_nanos(s: &str) -> Result<i64> {
+    let invalid = || anyhow!("invalid duration `{s}`, expected e.g. `30s`, `1m30s` or `500ms`");
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+    let mut total = 0f64;
+    while !rest.is_empty() {
+        let number_len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .ok_or_else(invalid)?;
+        let number: f64 = rest[..number_len].parse().map_err(|_| invalid())?;
+        rest = &rest[number_len..];
+        let unit_len = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        let factor = match &rest[..unit_len] {
+            "ns" => 1.0,
+            "us" | "µs" => 1e3,
+            "ms" => 1e6,
+            "s" => 1e9,
+            "m" => 60e9,
+            "h" => 3600e9,
+            _ => return Err(invalid()),
+        };
+        rest = &rest[unit_len..];
+        total += number * factor;
+    }
+    if total > i64::MAX as f64 {
+        return Err(invalid());
+    }
+    Ok(total.round() as i64)
+}
+
+/// Docker image spec config fields that are not part of the OCI image spec. They are added to
+/// the image config next to the fields of [`Config`].
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct DockerConfigExtensions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<HealthConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<Vec<String>>,
+}
+
+/// The docker `Healthcheck` object. Durations are in nanoseconds.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct HealthConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_period: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_interval: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
 }
 
 /// A command given either as a shell-like string or as an argv list.
@@ -523,6 +678,88 @@ exposed-ports = [8080]
             destination: Some("sub/renamed".into()),
         };
         assert_eq!(e.destination("/app").unwrap(), "/app/sub/renamed");
+    }
+
+    #[test]
+    fn converts_healthcheck_and_shell() {
+        let m = parse(
+            r#"
+[tool.pixi-oci.oci-config]
+shell = ["/opt/env/bin/bash", "-c"]
+[tool.pixi-oci.oci-config.healthcheck]
+test = "curl -f http://localhost:8080 || exit 1"
+interval = "1m30s"
+timeout = 5
+start-period = "500ms"
+retries = 3
+"#,
+        );
+        let ext = m.tool.pixi_oci.oci_config.to_docker_extensions().unwrap();
+        assert_eq!(
+            ext.shell.as_deref(),
+            Some(&["/opt/env/bin/bash".to_string(), "-c".to_string()][..])
+        );
+        assert_eq!(
+            ext.healthcheck,
+            Some(HealthConfig {
+                test: Some(vec![
+                    "CMD-SHELL".into(),
+                    "curl -f http://localhost:8080 || exit 1".into()
+                ]),
+                interval: Some(90_000_000_000),
+                timeout: Some(5_000_000_000),
+                start_period: Some(500_000_000),
+                start_interval: None,
+                retries: Some(3),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&ext.healthcheck).unwrap()["StartPeriod"],
+            500_000_000
+        );
+    }
+
+    #[test]
+    fn healthcheck_test_variants() {
+        let test = |toml: &str| {
+            let m = parse(&format!(
+                "[tool.pixi-oci.oci-config.healthcheck]\ntest = {toml}\n"
+            ));
+            m.tool
+                .pixi_oci
+                .oci_config
+                .to_docker_extensions()
+                .map(|e| e.healthcheck.unwrap().test.unwrap())
+        };
+        assert_eq!(
+            test(r#"["curl", "-f", "localhost"]"#).unwrap(),
+            vec!["CMD", "curl", "-f", "localhost"]
+        );
+        assert_eq!(
+            test(r#"["CMD-SHELL", "true"]"#).unwrap(),
+            vec!["CMD-SHELL", "true"]
+        );
+        assert_eq!(test(r#"["NONE"]"#).unwrap(), vec!["NONE"]);
+        assert!(test("[]").is_err());
+        assert!(
+            toml::from_str::<Manifest>(
+                "[tool.pixi-oci.oci-config.healthcheck]\ninterval = \"5s\"\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_durations() {
+        assert_eq!(parse_duration_nanos("30s").unwrap(), 30_000_000_000);
+        assert_eq!(parse_duration_nanos("1h2m3.5s").unwrap(), 3_723_500_000_000);
+        assert_eq!(parse_duration_nanos("250ms").unwrap(), 250_000_000);
+        assert_eq!(parse_duration_nanos("10us").unwrap(), 10_000);
+        for invalid in ["", "30", "s", "5 minutes", "1.2.3s"] {
+            assert!(parse_duration_nanos(invalid).is_err(), "{invalid}");
+        }
+        assert!(DurationSpec::String("100us".into()).to_nanos().is_err());
+        assert!(DurationSpec::Seconds(0).to_nanos().is_err());
     }
 
     #[test]

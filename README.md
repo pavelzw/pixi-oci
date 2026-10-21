@@ -63,19 +63,36 @@ labels = { "org.opencontainers.image.source" = "https://github.com/you/example" 
 exposed-ports = [8080, "9090/udp"]
 volumes = ["/data"]
 stop-signal = "SIGTERM"
+shell = ["/opt/env/bin/bash", "-c"]
+
+[tool.pixi-oci.oci-config.healthcheck]
+test = ["curl", "-f", "http://localhost:8080"]
+interval = "30s"
+timeout = "5s"
+start-period = "10s"
+start-interval = "1s"
+retries = 3
 ```
 
-| key                | description                                                                                                                                                                    |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `base`             | A registry image to build on, or a minimal root filesystem built from scratch. See [Base](#base).                                                                              |
-| `environment`      | The pixi environment to put into the image.                                                                                                                                    |
-| `platform`         | Conda platform to build for. Only linux platforms are supported.                                                                                                               |
-| `install-prefix`   | Absolute path of the environment inside the image.                                                                                                                             |
-| `tag`              | Image reference as `name:tag`, or `name` for `name:latest`. Required unless `--tag` is given, which replaces it.                                                               |
-| `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                               |
-| `copy-to-image`    | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile.          |
-| `activation-shell` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts).                                                                              |
-| `oci-config.*`     | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`). |
+| key                | description                                                                                                                                                                                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`             | A registry image to build on, or a minimal root filesystem built from scratch. See [Base](#base).                                                                                                                                       |
+| `environment`      | The pixi environment to put into the image.                                                                                                                                                                                             |
+| `platform`         | Conda platform to build for. Only linux platforms are supported.                                                                                                                                                                        |
+| `install-prefix`   | Absolute path of the environment inside the image.                                                                                                                                                                                      |
+| `tag`              | Image reference as `name:tag`, or `name` for `name:latest`. Required unless `--tag` is given, which replaces it.                                                                                                                        |
+| `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                                                                                        |
+| `copy-to-image`    | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile.                                                                   |
+| `activation-shell` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts).                                                                                                                                       |
+| `oci-config.*`     | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`, `healthcheck`, `shell`). See [Healthcheck](#healthcheck). |
+
+### Healthcheck
+
+`oci-config.healthcheck` works like `HEALTHCHECK` in a Dockerfile. A string `test` runs through the image's shell (`CMD-SHELL`), a list is executed directly (`CMD`). Lists that already start with `CMD`, `CMD-SHELL` or `NONE` are kept as they are, so `test = ["NONE"]` disables a healthcheck inherited from the base image. Durations are Go-style strings (`"30s"`, `"1m30s"`, `"500ms"`) or integers in seconds.
+
+`oci-config.shell` sets the shell for `CMD-SHELL` healthchecks, like `SHELL` in a Dockerfile. A scratch base has no `/bin/sh`, so either use the list form of `test` or add `bash` to the environment and set `shell = ["<install-prefix>/bin/bash", "-c"]`.
+
+Both fields are docker extensions to the OCI image config: docker honours them, runtimes that only follow the OCI image spec ignore them. Unset fields are inherited from the base image.
 
 ### Base
 
