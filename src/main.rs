@@ -83,6 +83,16 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Ctrl-C would otherwise leave the staging directories (often gigabytes) and a partial
+    // output behind, as the process is terminated without running destructors.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n🛑 Interrupted, cleaning up");
+            let _guard = pixi_oci::cleanup::clean_up();
+            std::process::exit(130);
+        }
+    });
+
     match cli.command {
         Command::Build(args) => {
             let report = pixi_oci::build(BuildOptions {
