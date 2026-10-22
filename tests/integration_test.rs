@@ -518,6 +518,8 @@ async fn docker_can_load_and_run(tmpdir: tempfile::TempDir) {
     let (subdir, oci_platform) = match host_arch.as_str() {
         "aarch64" | "arm64" => ("linux-aarch64", "linux/arm64"),
         "x86_64" | "amd64" => ("linux-64", "linux/amd64"),
+        "ppc64le" => ("linux-ppc64le", "linux/ppc64le"),
+        "riscv64" => ("linux-riscv64", "linux/riscv64"),
         other => {
             eprintln!("the example has no packages for docker's architecture {other}, skipping");
             return;
@@ -558,6 +560,8 @@ async fn docker_can_load_and_run(tmpdir: tempfile::TempDir) {
     // The Debian dynamic loader is reachable through the /lib64 (/lib) symlink and runs.
     let loader = match subdir {
         "linux-aarch64" => "/lib/ld-linux-aarch64.so.1",
+        "linux-ppc64le" => "/lib64/ld64.so.2",
+        "linux-riscv64" => "/lib/ld-linux-riscv64-lp64d.so.1",
         _ => "/lib64/ld-linux-x86-64.so.2",
     };
     let run = Command::new("docker")

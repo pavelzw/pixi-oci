@@ -11,8 +11,8 @@ platforms = [
 
 [dependencies]
 caddy = "*"
-pandas = "*"
 numpy = "*"
+pydantic = "*"
 requests = ">=2.34.2,<3"
 
 [tool.pixi-oci]
