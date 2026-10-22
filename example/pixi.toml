@@ -11,7 +11,6 @@ platforms = [
 
 [dependencies]
 caddy = "*"
-polars = "*"
 pandas = "*"
 numpy = "*"
 requests = ">=2.34.2,<3"
