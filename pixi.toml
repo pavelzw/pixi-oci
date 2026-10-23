@@ -2,7 +2,7 @@
 name = "pixi-oci"
 channels = ["conda-forge"]
 exclude-newer = "7d"
-platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64", "win-64"]
 
 [tasks]
 build = "cargo build --release"
@@ -13,7 +13,6 @@ pre-commit-run = "pre-commit run -a"
 
 [dependencies]
 rust = "==1.98.1"
-openssl = "3.*"
 pkg-config = "*"
 pre-commit = "*"
 prettier = "*"

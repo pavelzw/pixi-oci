@@ -1,0 +1,2 @@
+# Keep LF line endings on Windows checkouts, the tests compare file contents byte by byte.
+* text=auto eol=lf

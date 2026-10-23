@@ -43,10 +43,7 @@ indicatif = "0.18"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 oci-client = { version = "0.18", default-features = false }
 oci-spec = "0.10"
-ocidir = "0.8"
-rattler = { version = "0.54.1", default-features = false, features = [
-  "indicatif",
-] }
+rattler = { version = "0.54.1", default-features = false }
 rattler_cache = { version = "0.10.19", default-features = false }
 rattler_conda_types = "0.57.0"
 rattler_config = "0.9.3"
@@ -94,3 +91,26 @@ liblzma = { version = "0.4", default-features = false, features = [
 sha1 = { version = "0.10", optional = true }
 tar = { version = "0.4", optional = true }
 ureq = { version = "3", optional = true }
+
+# Linking packages straight from their archives (`rattler::install::from_archive`) is not
+# released yet. All rattler crates come from the same revision to avoid duplicate versions.
+[patch.crates-io]
+file_url = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+path_resolver = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_cache = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_conda_types = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_conda_version = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_config = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_digest = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_lock = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_macros = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_menuinst = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_networking = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_package_streaming = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_pty = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_redaction = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_shell = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_sigstore = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+rattler_solve = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }
+simple_spawn_blocking = { git = "https://github.com/conda/rattler", branch = "claude/sweet-hypatia-azs5o3" }

@@ -5,7 +5,9 @@
 
 Build OCI container images from [pixi](https://pixi.sh) environments, without Docker, BuildKit or any other daemon.
 
-`pixi-oci` reads `pixi.toml` and `pixi.lock`, installs the locked conda packages of one environment into a prefix, slices that prefix into cacheable layers, stacks them on a base image pulled straight from a registry and writes an OCI image tarball.
+`pixi-oci` reads `pixi.toml` and `pixi.lock`, downloads the locked conda packages of one environment, slices them into cacheable layers, stacks them on a base image pulled straight from a registry and writes an OCI image tarball.
+
+The files of the packages are streamed from their archives straight into the layers, nothing is installed on the build host. Symlinks, permissions and file names that only differ in case therefore end up in the image exactly as packaged, so `pixi-oci` builds the same Linux images on Linux, macOS and Windows. The downloaded archives are cached in `archives/` of the rattler cache directory (`RATTLER_CACHE_DIR`).
 
 It replaces the usual multi-stage Dockerfile dance (`pixi install` → `pixi shell-hook` → `COPY --from=build`) with a single command and a few lines of configuration.
 
@@ -69,7 +71,7 @@ stop-signal = "SIGTERM"
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `base`             | A registry image to build on, or a minimal root filesystem built from scratch. See [Base](#base).                                                                              |
 | `environment`      | The pixi environment to put into the image.                                                                                                                                    |
-| `platform`         | Conda platform to build for. Only linux platforms are supported.                                                                                                               |
+| `platform`         | Conda platform to build for. Only linux platforms are supported. Required when the build host is not linux and the lockfile has several linux platforms.                       |
 | `install-prefix`   | Absolute path of the environment inside the image.                                                                                                                             |
 | `tag`              | Image reference as `name:tag`, or `name` for `name:latest`. Required unless `--tag` is given, which replaces it.                                                               |
 | `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                               |

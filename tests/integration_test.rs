@@ -507,13 +507,21 @@ async fn docker_can_load_and_run(tmpdir: tempfile::TempDir) {
         eprintln!("docker not available, skipping");
         return;
     }
-    let host_arch = Command::new("docker")
-        .args(["info", "--format", "{{.Architecture}}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let docker_info = |format: &str| {
+        Command::new("docker")
+            .args(["info", "--format", format])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    // Docker on Windows hosts runs Windows containers by default.
+    if docker_info("{{.OSType}}") != "linux" {
+        eprintln!("docker does not run linux containers, skipping");
+        return;
+    }
+    let host_arch = docker_info("{{.Architecture}}");
     let (subdir, oci_platform) = match host_arch.as_str() {
         "aarch64" | "arm64" => ("linux-aarch64", "linux/arm64"),
         _ => ("linux-64", "linux/amd64"),

@@ -179,6 +179,18 @@ fn join_image_path(working_dir: &str, rel: &str) -> String {
     format!("{}/{}", working_dir.trim_end_matches('/'), rel)
 }
 
+/// Join the components of a relative host path with `/`, whatever the separator of the build
+/// host is.
+pub fn relative_image_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Normalize an absolute in-image path: collapse `//`, `.` and trailing slashes.
 pub fn normalize_image_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();

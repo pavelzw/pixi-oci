@@ -10,12 +10,12 @@ use oci_spec::image::{
     ImageIndexBuilder, ImageManifest, ImageManifestBuilder, MediaType, Os, RootFsBuilder,
     SCHEMA_VERSION,
 };
-use ocidir::OciDir;
 use serde::Serialize;
 
 use crate::{
     base_image::{BaseImage, TargetPlatform},
     layers::{PlannedLayer, write_layer},
+    oci_layout::OciLayout,
 };
 
 /// Annotation holding the tag, read by podman, skopeo and containerd.
@@ -100,7 +100,7 @@ pub fn prepend_entrypoint(config: &mut Config, prefix: Vec<String>) {
 
 /// Inputs for [`assemble_image`].
 pub struct AssembleInputs<'a> {
-    pub output: &'a OciDir,
+    pub output: &'a OciLayout,
     pub output_dir: &'a Path,
     pub base: Option<&'a BaseImage>,
     pub layers: &'a [PlannedLayer],
@@ -128,14 +128,18 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
 
     let created = inputs.created.to_rfc3339_opts(SecondsFormat::Secs, true);
     for planned in inputs.layers {
-        eprintln!(
-            "📦 Writing layer: {} ({} files)",
-            planned.description,
-            planned.files.len()
-        );
+        if planned.packages.is_empty() {
+            eprintln!(
+                "📦 Writing layer: {} ({} files)",
+                planned.description,
+                planned.entries.len()
+            );
+        } else {
+            eprintln!("📦 Writing layer: {}", planned.description);
+        }
         let layer = write_layer(inputs.output, planned)
             .with_context(|| format!("could not write layer `{}`", planned.description))?;
-        diff_ids.push(layer.uncompressed_sha256_as_digest().to_string());
+        diff_ids.push(layer.diff_id());
         layer_descriptors.push(layer.descriptor().build()?);
         history.push(
             HistoryBuilder::default()

@@ -1,8 +1,9 @@
 //! Build OCI images from pixi environments without a container daemon.
 //!
-//! The pipeline: read `pixi.toml` + `pixi.lock`, install the locked conda packages of one
-//! environment into a staging prefix with rattler, split the prefix into layers, stack them
-//! on a base image pulled straight from a registry and write an OCI layout (directory or tar).
+//! The pipeline: read `pixi.toml` + `pixi.lock`, download the locked conda packages of one
+//! environment, split them into layers that are written straight from the package archives,
+//! stack them on a base image pulled straight from a registry and write an OCI layout
+//! (directory or tar). Nothing is installed on the build host, so the host can run any OS.
 
 pub mod activation;
 pub mod archive;
@@ -13,18 +14,18 @@ pub mod image;
 pub mod install;
 pub mod layers;
 pub mod lockfile;
+pub mod oci_layout;
 pub mod rootfs;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Arch;
-use ocidir::{OciDir, cap_std};
 use rattler_conda_types::Subdir;
 use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
 
 use crate::{
-    activation::{ActivationInputs, prepare_activation},
+    activation::{ActivationInputs, prepare_activation, stage_activation_files},
     archive::{
         DockerManifestEntry, Output, blob_path, prune_blobs, write_docker_manifest,
         write_oci_archive,
@@ -36,9 +37,10 @@ use crate::{
         DEFAULT_TAG, LoadedManifest,
     },
     image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
-    install::{install_environment, load_config, reqwest_client_from_config},
-    layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
+    install::{load_config, plan_environment, reqwest_client_from_config},
+    layers::{LayerEntry, PlannedLayer, PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
+    oci_layout::OciLayout,
     rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
 };
 
@@ -117,13 +119,6 @@ fn split_reference(reference: &str) -> (String, Option<String>) {
     }
 }
 
-fn open_dir(path: &Path) -> Result<cap_std::fs::Dir> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
-        .with_context(|| format!("could not open {}", path.display()))
-}
-
 /// Run a build.
 pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let loaded = LoadedManifest::load(&options.manifest_path)?;
@@ -188,7 +183,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         check_glibc(&locked.records, glibc.as_ref())?;
     }
 
-    // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
+    // The rattler cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
     let cache_dir = rattler_cache::default_cache_dir()
         .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?;
 
@@ -213,43 +208,28 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         }
     };
     let output_oci =
-        OciDir::ensure(open_dir(&layout_dir)?).context("could not create the output OCI layout")?;
+        OciLayout::ensure(&layout_dir).context("could not create the output OCI layout")?;
 
     let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
     let client = reqwest_client_from_config(&rattler_config)?;
 
     // Fetch the base while nothing else needs the network heavily: pull the registry image, or
     // assemble the root filesystem for a scratch base.
-    let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match &base_spec {
         BaseSpec::Image(image) => (
             fetch_base_image(image, &platform, &output_oci).await?,
             Vec::new(),
         ),
-        BaseSpec::Scratch(scratch) => (
-            None,
-            plan_rootfs_layers(scratch, subdir, &client, rootfs_staging.path()).await?,
-        ),
+        BaseSpec::Scratch(scratch) => (None, plan_rootfs_layers(scratch, subdir, &client).await?),
     };
 
-    // Install the environment into a staging directory mirroring the in-image layout.
-    let staging = TempDir::new("pixi-oci-")?;
-    let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
-    std::fs::create_dir_all(&staging_prefix)?;
     let packages = locked.records.len();
-    eprintln!("⬇️  Installing {packages} packages into {install_prefix}");
-    install_environment(
-        &staging_prefix,
-        &install_prefix,
-        subdir,
-        locked.records,
-        client,
-        &cache_dir,
-    )
-    .await?;
+    eprintln!("⬇️  Fetching {packages} packages for {install_prefix}");
+    let plan =
+        plan_environment(&install_prefix, subdir, locked.records, client, &cache_dir).await?;
 
-    // Activation: static env vars plus the wrapper script (written into the staging prefix,
-    // so it has to happen before the layers are planned).
+    // Activation: static env vars plus the wrapper script. Only the activation scripts are
+    // staged on the host to inspect them.
     let base_config = base.as_ref().and_then(|b| b.config.config().as_ref());
     let base_env: Vec<(String, String)> = base_config
         .and_then(|c| c.env().as_ref())
@@ -265,8 +245,10 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .map(|e| e.to_pairs())
         .transpose()?
         .unwrap_or_default();
+    let activation_staging = TempDir::new("pixi-oci-activation-")?;
+    stage_activation_files(plan.packages(), activation_staging.path())?;
     let activation = prepare_activation(ActivationInputs {
-        staging_prefix: &staging_prefix,
+        staging_prefix: activation_staging.path(),
         install_prefix: &install_prefix,
         subdir,
         base_env: &base_env,
@@ -282,11 +264,33 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 
     let mut layers = rootfs_layers;
     let rootfs_layer_count = layers.len();
-    layers.extend(plan_package_layers(
-        &staging_prefix,
+    let mut package_layers = plan_package_layers(
+        plan.into_packages(),
         &install_prefix,
         &PopularitySplitter { max_layers },
-    )?);
+    )?;
+    // conda expects a history file in every prefix. It goes into the last package layer
+    // together with the activation wrapper.
+    let mut environment_entries = vec![LayerEntry::File {
+        image_path: format!("{install_prefix}/conda-meta/history"),
+        mode: 0o644,
+        contents: Vec::new(),
+    }];
+    if let Some(wrapper) = &activation.wrapper {
+        environment_entries.push(LayerEntry::File {
+            image_path: wrapper.image_path.clone(),
+            mode: 0o755,
+            contents: wrapper.contents.clone().into_bytes(),
+        });
+    }
+    match package_layers.last_mut() {
+        Some(last) => last.entries.extend(environment_entries),
+        None => package_layers.push(PlannedLayer::with_entries(
+            "pixi-oci: environment",
+            environment_entries,
+        )),
+    }
+    layers.extend(package_layers);
     let package_layers = layers.len() - rootfs_layer_count;
     let copy_layer = plan_copy_layer(&loaded.dir, &cfg.copy_to_image, &working_dir)?;
     let has_copy_layer = copy_layer.is_some();
@@ -297,7 +301,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     user_config.set_env(Some(activation.env));
     let mut merged = merge_config(base_config, &user_config);
     if let Some(wrapper) = activation.wrapper {
-        prepend_entrypoint(&mut merged, vec![activation_shell, wrapper]);
+        prepend_entrypoint(&mut merged, vec![activation_shell, wrapper.image_path]);
     }
 
     let assembled = assemble_image(AssembleInputs {

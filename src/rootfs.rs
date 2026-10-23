@@ -3,9 +3,9 @@
 
 use std::{
     borrow::Cow,
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-    path::{Component, Path, PathBuf},
+    collections::HashMap,
+    io::Read,
+    path::{Component, PathBuf},
     str::FromStr,
 };
 
@@ -14,11 +14,10 @@ use rattler_conda_types::{MatchSpec, ParseStrictness, RepoDataRecord, Subdir, Ve
 use reqwest_middleware::ClientWithMiddleware;
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
-use walkdir::WalkDir;
 
 use crate::{
-    config::ScratchBase,
-    layers::{FileEntry, PlannedLayer},
+    config::{ScratchBase, relative_image_path},
+    layers::{LayerEntry, PlannedLayer},
 };
 
 /// Debian's snapshot archive. It keeps every package version ever published, so pinned
@@ -119,12 +118,11 @@ pub fn check_glibc(records: &[RepoDataRecord], glibc: Option<&Version>) -> Resul
 }
 
 /// Plan the layers of a from-scratch base: glibc (if enabled) and the shadow setup (if enabled).
-/// Files are staged below `staging`.
+/// The files are kept in memory, nothing is written to the build host.
 pub async fn plan_rootfs_layers(
     base: &ScratchBase,
     subdir: Subdir,
     client: &ClientWithMiddleware,
-    staging: &Path,
 ) -> Result<Vec<PlannedLayer>> {
     let mut layers = Vec::new();
     if let Some(version) = base.glibc.debian_version() {
@@ -133,72 +131,65 @@ pub async fn plan_rootfs_layers(
             Some(deb) => Cow::Borrowed(deb),
             None => Cow::Owned(fetch_deb(client, "libc6", version, arch).await?),
         };
-        let root = staging.join("glibc");
-        extract_deb(&deb, &root, keep_glibc_file)
+        let mut entries = deb_entries(&deb, keep_glibc_file)
             .with_context(|| format!("could not extract libc6 {version} ({arch})"))?;
         // Debian gets these from `base-files` (merged /usr). Binaries look up the dynamic
         // loader through them, e.g. /lib64/ld-linux-x86-64.so.2.
-        symlink("usr/lib", root.join("lib"))?;
-        if root.join("usr/lib64").is_dir() {
-            symlink("usr/lib64", root.join("lib64"))?;
-        }
-        fs::write(root.join("etc/nsswitch.conf"), NSSWITCH)?;
-        layers.push(PlannedLayer {
-            description: format!("pixi-oci: glibc {version} (debian libc6)"),
-            files: tree_entries(&root, &[])?,
+        let has_lib64 = entries
+            .iter()
+            .any(|entry| entry.image_path().starts_with("/usr/lib64/"));
+        entries.push(LayerEntry::Symlink {
+            image_path: "/lib".to_string(),
+            target: "usr/lib".to_string(),
         });
+        if has_lib64 {
+            entries.push(LayerEntry::Symlink {
+                image_path: "/lib64".to_string(),
+                target: "usr/lib64".to_string(),
+            });
+        }
+        entries.retain(|entry| entry.image_path() != "/etc/nsswitch.conf");
+        entries.push(LayerEntry::File {
+            image_path: "/etc/nsswitch.conf".to_string(),
+            mode: 0o644,
+            contents: NSSWITCH.as_bytes().to_vec(),
+        });
+        layers.push(PlannedLayer::with_entries(
+            format!("pixi-oci: glibc {version} (debian libc6)"),
+            entries,
+        ));
     }
     if base.shadow_setup {
-        let root = staging.join("shadow");
-        fs::create_dir_all(root.join("etc"))?;
-        for (name, contents) in [
+        let mut entries: Vec<LayerEntry> = [
             ("passwd", PASSWD),
             ("shadow", SHADOW),
             ("group", GROUP),
             ("gshadow", GSHADOW),
-        ] {
-            fs::write(root.join("etc").join(name), contents)?;
-        }
+        ]
+        .into_iter()
+        .map(|(name, contents)| LayerEntry::File {
+            image_path: format!("/etc/{name}"),
+            mode: 0o644,
+            contents: contents.as_bytes().to_vec(),
+        })
+        .collect();
         for (dir, mode) in [("root", 0o700), ("tmp", 0o1777)] {
-            fs::create_dir(root.join(dir))?;
-            fs::set_permissions(root.join(dir), fs::Permissions::from_mode(mode))?;
+            entries.push(LayerEntry::Dir {
+                image_path: format!("/{dir}"),
+                mode,
+            });
         }
-        layers.push(PlannedLayer {
-            description: "pixi-oci: shadow setup".to_string(),
-            files: tree_entries(&root, &["root", "tmp"])?,
-        });
+        layers.push(PlannedLayer::with_entries(
+            "pixi-oci: shadow setup",
+            entries,
+        ));
     }
     Ok(layers)
 }
 
-/// Everything below `root` that is not a directory, plus the directories in `dirs` (which keep
-/// their permissions in the layer).
-fn tree_entries(root: &Path, dirs: &[&str]) -> Result<Vec<FileEntry>> {
-    let mut files: Vec<FileEntry> = dirs
-        .iter()
-        .map(|dir| FileEntry {
-            host_path: root.join(dir),
-            image_path: format!("/{dir}"),
-        })
-        .collect();
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry?;
-        if entry.file_type().is_dir() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(root)?;
-        files.push(FileEntry {
-            host_path: entry.path().to_path_buf(),
-            image_path: format!("/{}", rel.to_string_lossy()),
-        });
-    }
-    Ok(files)
-}
-
 /// Drop documentation (except the copyright file), lintian overrides and the iconv `gconv`
 /// modules (8 of the 13 MB; UTF-8, ASCII and Latin-1 are built into glibc).
-fn keep_glibc_file(path: &Path) -> bool {
-    let path = path.to_string_lossy();
+fn keep_glibc_file(path: &str) -> bool {
     if path.starts_with("usr/share/doc/") {
         return path.ends_with("/copyright");
     }
@@ -293,28 +284,80 @@ async fn fetch_deb(
     Ok(data.to_vec())
 }
 
-/// Unpack the `data.tar.xz` of a `.deb` into `dest`, keeping only the paths `keep` accepts.
-/// Directories are created as needed rather than taken from the archive.
-fn extract_deb(deb: &[u8], dest: &Path, keep: impl Fn(&Path) -> bool) -> Result<()> {
+/// The files and symlinks in the `data.tar.xz` of a `.deb` that `keep` accepts. Directories
+/// are created as needed rather than taken from the archive, hard links become copies.
+fn deb_entries(deb: &[u8], keep: impl Fn(&str) -> bool) -> Result<Vec<LayerEntry>> {
     let data = ar_member(deb, "data.tar.xz")?;
-    fs::create_dir_all(dest)?;
     let mut archive = tar::Archive::new(liblzma::read::XzDecoder::new(data));
+    let mut entries = Vec::new();
+    // Index into `entries` by the path in the archive, to resolve hard links.
+    let mut files: HashMap<PathBuf, usize> = HashMap::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        if entry.header().entry_type().is_dir() {
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
             continue;
         }
+        // Only normal components, so the path cannot leave the image root.
         let path: PathBuf = entry
             .path()?
             .components()
             .filter(|c| matches!(c, Component::Normal(_)))
             .collect();
-        if keep(&path) {
-            // `unpack_in` refuses paths that would escape `dest`.
-            entry.unpack_in(dest)?;
+        let relative = relative_image_path(&path);
+        if !keep(&relative) {
+            continue;
+        }
+        let image_path = format!("/{relative}");
+        let mode = entry.header().mode()?;
+        match entry_type {
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                let mut contents = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut contents)?;
+                files.insert(path, entries.len());
+                entries.push(LayerEntry::File {
+                    image_path,
+                    mode,
+                    contents,
+                });
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()?
+                    .ok_or_else(|| anyhow!("symlink {} has no target", path.display()))?;
+                entries.push(LayerEntry::Symlink {
+                    image_path,
+                    target: target.to_string_lossy().into_owned(),
+                });
+            }
+            tar::EntryType::Link => {
+                let target: PathBuf = entry
+                    .link_name()?
+                    .ok_or_else(|| anyhow!("hard link {} has no target", path.display()))?
+                    .components()
+                    .filter(|c| matches!(c, Component::Normal(_)))
+                    .collect();
+                let Some(LayerEntry::File { mode, contents, .. }) =
+                    files.get(&target).map(|&i| &entries[i])
+                else {
+                    bail!(
+                        "hard link {} points to {}, which is not a file before it",
+                        path.display(),
+                        target.display()
+                    );
+                };
+                let entry = LayerEntry::File {
+                    image_path,
+                    mode: *mode,
+                    contents: contents.clone(),
+                };
+                files.insert(path, entries.len());
+                entries.push(entry);
+            }
+            other => bail!("unsupported entry type {other:?} for {}", path.display()),
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// The contents of the member `name` of a Unix `ar` archive, the container format of `.deb`
@@ -381,14 +424,10 @@ mod tests {
 
     #[test]
     fn filters_glibc_files() {
-        assert!(keep_glibc_file(Path::new(
-            "usr/lib/x86_64-linux-gnu/libc.so.6"
-        )));
-        assert!(keep_glibc_file(Path::new("usr/share/doc/libc6/copyright")));
-        assert!(!keep_glibc_file(Path::new("usr/share/doc/libc6/NEWS.gz")));
-        assert!(!keep_glibc_file(Path::new(
-            "usr/lib/x86_64-linux-gnu/gconv/UTF-16.so"
-        )));
+        assert!(keep_glibc_file("usr/lib/x86_64-linux-gnu/libc.so.6"));
+        assert!(keep_glibc_file("usr/share/doc/libc6/copyright"));
+        assert!(!keep_glibc_file("usr/share/doc/libc6/NEWS.gz"));
+        assert!(!keep_glibc_file("usr/lib/x86_64-linux-gnu/gconv/UTF-16.so"));
     }
 
     #[test]

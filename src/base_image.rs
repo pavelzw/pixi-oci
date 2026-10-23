@@ -13,9 +13,8 @@ use oci_client::{
 use oci_spec::image::{
     Arch, Descriptor, DescriptorBuilder, Digest, ImageConfiguration, MediaType, Os,
 };
-use ocidir::{OciDir, OciRead};
 
-use crate::config::SCRATCH;
+use crate::{config::SCRATCH, oci_layout::OciLayout};
 
 /// A base image whose layers are available in the output layout.
 #[derive(Debug)]
@@ -87,7 +86,7 @@ fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
 pub async fn fetch_base_image(
     image: &str,
     platform: &TargetPlatform,
-    output: &OciDir,
+    output: &OciLayout,
 ) -> Result<Option<BaseImage>> {
     if image == SCRATCH {
         return Ok(None);
@@ -164,7 +163,7 @@ async fn download_blob(
     reference: &Reference,
     layer: &OciDescriptor,
     descriptor: &Descriptor,
-    output: &OciDir,
+    output: &OciLayout,
 ) -> Result<()> {
     let mut stream = client
         .pull_blob_stream(reference, layer)

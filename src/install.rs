@@ -1,10 +1,12 @@
-//! Downloading and installing the locked packages into a staging prefix.
+//! Downloading the locked packages and planning where their files go in the image.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use rattler::install::{IndicatifReporter, Installer, LinkOptions};
-use rattler_cache::{PACKAGE_CACHE_DIR, package_cache::PackageCache};
+use futures::{StreamExt, TryStreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
+use rattler::install::from_archive::{ArchiveLinkOptions, ArchivePackage, LinkPlan};
+use rattler_cache::{ARCHIVE_CACHE_DIR, archive_cache::ArchiveCache};
 use rattler_conda_types::{RepoDataRecord, Subdir};
 use rattler_networking::{
     AuthenticationMiddleware, AuthenticationStorage, MirrorMiddleware,
@@ -64,44 +66,52 @@ pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMi
     Ok(client)
 }
 
-/// Install `records` into `staging_prefix` on the host. Hardcoded prefix paths inside the files
-/// are patched to `install_prefix`, the location the environment will have inside the image.
-pub async fn install_environment(
-    staging_prefix: &Path,
+/// How many archives are downloaded at the same time.
+const CONCURRENT_DOWNLOADS: usize = 16;
+
+/// Download the archives of `records` (or take them from the archive cache) and plan where
+/// their files end up below `install_prefix`.
+///
+/// Nothing is installed on the build host: the files are later streamed from the archives
+/// straight into the layers, so symlinks, permissions and file names survive no matter which
+/// filesystem the build host has.
+pub async fn plan_environment(
     install_prefix: &str,
     subdir: Subdir,
     records: Vec<RepoDataRecord>,
     client: ClientWithMiddleware,
     cache_dir: &Path,
-) -> Result<usize> {
-    let package_cache = PackageCache::new(cache_dir.join(PACKAGE_CACHE_DIR));
-    let result = Installer::new()
-        .with_download_client(client)
-        .with_package_cache(package_cache)
-        .with_target_platform(subdir)
-        .with_alternative_target_prefix(install_prefix)
-        // Link scripts would run against the staging path on the build host, not the
-        // final prefix, so they stay disabled.
-        .with_execute_link_scripts(false)
-        // On macOS, rattler reflinks whole directories when it can, and whether a shared
-        // directory like `lib/` gets reflinked depends on which package gets there first. That
-        // makes `sha256_in_prefix` in conda-meta non-deterministic and breaks reproducible
-        // layers: https://github.com/conda/rattler/issues/2966
-        .with_link_options(LinkOptions {
-            allow_ref_links: Some(false),
-            ..Default::default()
+) -> Result<LinkPlan> {
+    let cache = ArchiveCache::new(cache_dir.join(ARCHIVE_CACHE_DIR));
+    let progress = ProgressBar::new(records.len() as u64).with_style(
+        ProgressStyle::with_template("{spinner} {msg} [{bar:30}] {pos}/{len}")
+            .expect("valid template")
+            .progress_chars("=> "),
+    );
+    progress.set_message("Fetching packages");
+
+    let packages: Vec<(RepoDataRecord, ArchivePackage)> = futures::stream::iter(records)
+        .map(|record| {
+            let (cache, client, progress) = (&cache, &client, &progress);
+            async move {
+                let archive = cache
+                    .get_or_fetch(&record, client, None)
+                    .await
+                    .with_context(|| format!("could not download {}", record.url))?;
+                // Reading the metadata of a `.tar.bz2` decompresses the whole archive.
+                let package =
+                    tokio::task::spawn_blocking(move || ArchivePackage::from_path(archive))
+                        .await?
+                        .with_context(|| format!("could not read {}", record.url))?;
+                progress.inc(1);
+                anyhow::Ok((record, package))
+            }
         })
-        .with_reporter(IndicatifReporter::builder().finish())
-        .install(staging_prefix, records)
-        .await
-        .context("could not install the environment")?;
+        .buffered(CONCURRENT_DOWNLOADS)
+        .try_collect()
+        .await?;
+    progress.finish_and_clear();
 
-    // conda expects a history file in every prefix.
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(staging_prefix.join("conda-meta/history"))
-        .context("could not create conda-meta/history")?;
-
-    Ok(result.transaction.operations.len())
+    LinkPlan::new(packages, ArchiveLinkOptions::new(install_prefix, subdir))
+        .context("could not plan the installation of the environment")
 }

@@ -1,18 +1,17 @@
 //! Environment activation inside the image: static environment variables in the image config
 //! plus a small wrapper that sources the `activate.d` scripts before running the command.
 
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Read, path::Path};
 
 use anyhow::{Context, Result};
+use rattler::install::from_archive::{PlannedPackage, PrefixSink};
 use rattler_conda_types::Subdir;
 use rattler_shell::{
     activation::{Activator, prefix_path_entries},
     shell::Bash,
 };
+
+use crate::config::relative_image_path;
 
 /// Default `PATH` when neither the base image nor the user define one.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -24,13 +23,91 @@ pub const WRAPPER_RELATIVE_PATH: &str = "etc/pixi-oci/entrypoint.sh";
 pub struct Activation {
     /// `KEY=VALUE` entries for the image config.
     pub env: Vec<String>,
-    /// Absolute in-image path of the wrapper script, if any activation scripts exist.
-    pub wrapper: Option<String>,
+    /// The wrapper script, if any activation scripts exist.
+    pub wrapper: Option<Wrapper>,
+}
+
+/// The generated script that sources the activation scripts.
+#[derive(Debug)]
+pub struct Wrapper {
+    /// Absolute path inside the image.
+    pub image_path: String,
+    pub contents: String,
+}
+
+/// The directories of the prefix that activation reads.
+const ACTIVATION_DIRS: [&str; 2] = ["etc/conda/activate.d", "etc/conda/env_vars.d"];
+
+fn is_activation_file(path: &Path) -> bool {
+    ACTIVATION_DIRS
+        .iter()
+        .any(|dir| path.parent() == Some(Path::new(dir)))
+}
+
+/// Writes the files the activation reads into a directory on the build host and drops the rest.
+struct ActivationSink<'a> {
+    staging_prefix: &'a Path,
+}
+
+impl PrefixSink for ActivationSink<'_> {
+    fn add_file(
+        &mut self,
+        path: &Path,
+        _mode: u32,
+        _size: u64,
+        contents: &mut dyn Read,
+    ) -> std::io::Result<()> {
+        if is_activation_file(path) {
+            let destination = self.staging_prefix.join(path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("activation files have a parent"),
+            )?;
+            std::io::copy(contents, &mut fs::File::create(destination)?)?;
+        }
+        Ok(())
+    }
+
+    fn add_symlink(&mut self, path: &Path, target: &Path) -> std::io::Result<()> {
+        if is_activation_file(path) {
+            tracing::warn!(
+                "ignoring the activation script {} because it is a symlink to {}",
+                path.display(),
+                target.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn add_directory(&mut self, _path: &Path, _mode: u32) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Write the activation scripts and environment variable files of `packages` into
+/// `staging_prefix`, so that [`prepare_activation`] can inspect them. Only the packages that
+/// ship such files are read.
+pub fn stage_activation_files(packages: &[PlannedPackage], staging_prefix: &Path) -> Result<()> {
+    for package in packages {
+        if !package.target_paths().any(is_activation_file) {
+            continue;
+        }
+        package
+            .link(ActivationSink { staging_prefix })
+            .with_context(|| {
+                format!(
+                    "could not read the activation scripts of {}",
+                    package.record().package_record.name.as_normalized()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Inputs for computing the activation.
 pub struct ActivationInputs<'a> {
-    /// The staging prefix on the host.
+    /// A directory on the host with the activation files, see [`stage_activation_files`].
     pub staging_prefix: &'a Path,
     /// The prefix path inside the image.
     pub install_prefix: &'a str,
@@ -70,8 +147,7 @@ impl OrderedEnv {
     }
 }
 
-/// Compute the environment variables and, when needed, write the wrapper script into the
-/// staging prefix.
+/// Compute the environment variables and, when needed, the wrapper script.
 pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
     let activator = Activator::from_path(inputs.staging_prefix, Bash::default(), inputs.subdir)
         .context("could not inspect the environment for activation scripts")?;
@@ -84,7 +160,7 @@ pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
     let prefix_paths: Vec<String> =
         prefix_path_entries(Path::new(inputs.install_prefix), &inputs.subdir)
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| image_path_string(p))
             .collect();
     let base_path = env.get("PATH").unwrap_or(DEFAULT_PATH).to_string();
     env.set("PATH", format!("{}:{}", prefix_paths.join(":"), base_path));
@@ -106,10 +182,10 @@ pub fn prepare_activation(inputs: ActivationInputs<'_>) -> Result<Activation> {
             .iter()
             .map(|script| rebase(script, inputs.staging_prefix, inputs.install_prefix))
             .collect::<Result<_>>()?;
-        let wrapper_image_path = format!("{}/{WRAPPER_RELATIVE_PATH}", inputs.install_prefix);
-        let wrapper_host_path = inputs.staging_prefix.join(WRAPPER_RELATIVE_PATH);
-        write_wrapper(&wrapper_host_path, &scripts)?;
-        Some(wrapper_image_path)
+        Some(Wrapper {
+            image_path: format!("{}/{WRAPPER_RELATIVE_PATH}", inputs.install_prefix),
+            contents: render_wrapper(&scripts),
+        })
     };
 
     Ok(Activation {
@@ -135,7 +211,12 @@ fn rebase(script: &Path, staging_prefix: &Path, install_prefix: &str) -> Result<
             script.display()
         )
     })?;
-    Ok(format!("{install_prefix}/{}", rel.to_string_lossy()))
+    Ok(format!("{install_prefix}/{}", relative_image_path(rel)))
+}
+
+/// An absolute image path built with the path functions of the host, with `/` separators.
+fn image_path_string(path: &Path) -> String {
+    format!("/{}", relative_image_path(path))
 }
 
 /// Render the wrapper script contents.
@@ -151,16 +232,6 @@ pub fn render_wrapper(scripts: &[String]) -> String {
     }
     out.push_str("exec \"$@\"\n");
     out
-}
-
-fn write_wrapper(path: &PathBuf, scripts: &[String]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, render_wrapper(scripts))
-        .with_context(|| format!("could not write {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -211,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_wrapper_when_scripts_exist() {
+    fn renders_wrapper_when_scripts_exist() {
         let tmp = tempfile::tempdir().unwrap();
         let activate_d = tmp.path().join("etc/conda/activate.d");
         fs::create_dir_all(&activate_d).unwrap();
@@ -225,11 +296,9 @@ mod tests {
             user_env: &[],
         })
         .unwrap();
-        assert_eq!(
-            activation.wrapper.as_deref(),
-            Some("/opt/env/etc/pixi-oci/entrypoint.sh")
-        );
-        let contents = fs::read_to_string(tmp.path().join(WRAPPER_RELATIVE_PATH)).unwrap();
+        let wrapper = activation.wrapper.unwrap();
+        assert_eq!(wrapper.image_path, "/opt/env/etc/pixi-oci/entrypoint.sh");
+        let contents = wrapper.contents;
         let a = contents.find("activate.d/a.sh").unwrap();
         let b = contents.find("activate.d/b.sh").unwrap();
         assert!(a < b, "scripts must be sourced in sorted order");
