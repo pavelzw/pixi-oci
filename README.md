@@ -111,7 +111,7 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 
 ### Inject additional packages
 
-`--inject` adds local conda packages (`.conda` or `.tar.bz2`) that are not part of `pixi.lock` to the environment, like [`pixi-pack --inject`](https://github.com/Quantco/pixi-pack#inject-additional-packages). This is useful to put a freshly built package of your project into the image while still using the project's lockfile:
+`--inject` adds local conda packages (`.conda` or `.tar.bz2`) that are not part of `pixi.lock` to the environment. This is useful to put a freshly built package of your project into the image while still using the project's lockfile:
 
 ```shell
 pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h1234567_0.conda
