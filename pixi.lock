@@ -33,6 +33,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/c-ares-1.34.8-hebe6cf0_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/c-compiler-2.0.0-ha29393d_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/cargo-mutants-27.1.0-hb17b654_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py314h8d76f0c_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/compilers-2.0.0-ha770c72_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/conda-gcc-specs-15.3.0-h8846f6e_7.conda
@@ -112,6 +113,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/c-ares-1.34.8-h29ee22c_2.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/c-compiler-2.0.0-h1f08cd5_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cargo-mutants-27.1.0-h069e38c_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cffi-2.1.1-py314h65cb5ac_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/compilers-2.0.0-h8af1aa0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/conda-gcc-specs-15.3.0-hbdd0822_7.conda
@@ -207,6 +209,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.14.7-pyh5ded981_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/bzip2-1.0.8-h374f1ed_10.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/c-ares-1.34.8-had63097_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-64/cargo-mutants-27.1.0-h19f9e61_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/cffi-2.1.1-py314h0656537_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/gmp-6.3.0-h65442b7_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-64/icu-78.3-py313hbf1d544_2.conda
@@ -265,6 +268,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/virtualenv-21.14.7-pyh5ded981_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/bzip2-1.0.8-h4e30115_10.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/c-ares-1.34.8-h74c22ad_2.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/cargo-mutants-27.1.0-h6fdd925_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/cffi-2.1.1-py314h618e29d_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/gmp-6.3.0-hf5e55b1_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/icu-78.3-py310h579977c_2.conda
@@ -366,6 +370,19 @@ packages:
   run_exports: {}
   size: 7017
   timestamp: 1786642183250
+- conda: https://conda.anaconda.org/conda-forge/linux-64/cargo-mutants-27.1.0-hb17b654_0.conda
+  sha256: 68aff97b51f92ad97c0cfc36594dfd6c3cac3ce57d64657186305d2b36680b35
+  md5: 250be425416861b37c11bff9f5a93113
+  depends:
+  - libgcc >=14
+  - __glibc >=2.17,<3.0.a0
+  constrains:
+  - __glibc >=2.17
+  license: MIT
+  license_family: MIT
+  run_exports: {}
+  size: 2355029
+  timestamp: 1782316935671
 - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-2.1.1-py314h8d76f0c_3.conda
   sha256: 15e38176fa2173e063a19dad3d55746ac4c757b028813380d7f22c42781af4c4
   md5: ee66d46f7693fdcbaa1761fb8a4f6c3d
@@ -1124,6 +1141,18 @@ packages:
   run_exports: {}
   size: 6988
   timestamp: 1786642160586
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cargo-mutants-27.1.0-h069e38c_0.conda
+  sha256: 2cb58e18271b42e8dfe852e1ad8e787f6b1098336645d2ceec55aa0fed2714ee
+  md5: ae246fcaba1ab23f776cc30cb1a2d040
+  depends:
+  - libgcc >=14
+  constrains:
+  - __glibc >=2.17
+  license: MIT
+  license_family: MIT
+  run_exports: {}
+  size: 2224382
+  timestamp: 1782318175815
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/cffi-2.1.1-py314h65cb5ac_3.conda
   sha256: cc2a7c807182bd18e07a6e255c98dc8a8feec2310ad2e801d296adebb8f2d9ea
   md5: 30b36a0c4239d65f98209664afb3485b
@@ -2144,6 +2173,18 @@ packages:
     - c-ares >=1.34.8,<2.0a0
   size: 205559
   timestamp: 1787170041830
+- conda: https://conda.anaconda.org/conda-forge/osx-64/cargo-mutants-27.1.0-h19f9e61_0.conda
+  sha256: 5bd7134fb987d1da2ca19c25d415696accbc7e8179c9e9cacaefaa69d98a730b
+  md5: 0dda179dfb99db261fda7a185cc3a85c
+  depends:
+  - __osx >=11.0
+  constrains:
+  - __osx >=11.0
+  license: MIT
+  license_family: MIT
+  run_exports: {}
+  size: 2299144
+  timestamp: 1782317256934
 - conda: https://conda.anaconda.org/conda-forge/osx-64/cffi-2.1.1-py314h0656537_3.conda
   sha256: 493eb10ddcd00cf42151f1a6303b5b08a3641172861583fe2e128e9bbc1db3e2
   md5: 5502c80a2761fbc926dc5847b69b7f53
@@ -2648,6 +2689,18 @@ packages:
     - c-ares >=1.34.8,<2.0a0
   size: 197819
   timestamp: 1787169996553
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/cargo-mutants-27.1.0-h6fdd925_0.conda
+  sha256: d53122b60de7bc10e415d7ef5618a07ad2bc152a17900cc3d47e7da5edfd3a1b
+  md5: 5c96bbcb1ebfc2799c8301cb640f0555
+  depends:
+  - __osx >=11.0
+  constrains:
+  - __osx >=11.0
+  license: MIT
+  license_family: MIT
+  run_exports: {}
+  size: 2145537
+  timestamp: 1782318245952
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/cffi-2.1.1-py314h618e29d_3.conda
   sha256: 172fcb9649244b38083d3242550841e9b24fafeb5530ea125b44f364172f4e9d
   md5: 1177738698334efc54d4e9a2f108c469

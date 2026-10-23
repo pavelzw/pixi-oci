@@ -10,6 +10,7 @@ test = "cargo test"
 example = "cargo run -- build --manifest-path example"
 pre-commit-install = "pre-commit install"
 pre-commit-run = "pre-commit run -a"
+mutants = "cargo mutants"
 
 [dependencies]
 rust = "==1.98.1"
@@ -21,6 +22,7 @@ taplo = "*"
 pre-commit-hooks = "*"
 typos = "*"
 shellcheck = "*"
+cargo-mutants = "*"
 
 [target.linux.dependencies]
 compilers = ">=1.7.0"
