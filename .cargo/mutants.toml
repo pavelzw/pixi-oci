@@ -1,0 +1,5 @@
+# Configuration for cargo-mutants: https://mutants.rs/
+# Run locally with `pixi run mutants`.
+
+# The integration tests pull packages and images over the network, so give each mutant more headroom.
+minimum_test_timeout = 300
