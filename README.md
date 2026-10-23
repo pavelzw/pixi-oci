@@ -3,6 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/pavelzw/pixi-oci/ci.yml?style=flat-square&branch=main)](https://github.com/pavelzw/pixi-oci/actions/workflows/ci.yml)
 [![Conda Platform](https://img.shields.io/conda/vn/conda-forge/pixi-oci?style=flat-square)](https://prefix.dev/channels/conda-forge/packages/pixi-oci)
 
+[![Crates.io](https://img.shields.io/crates/v/pixi-oci?style=flat-square)](https://crates.io/crates/pixi-oci)
 Build OCI container images from [pixi](https://pixi.sh) environments, without Docker, BuildKit or any other daemon.
 
 `pixi-oci` reads `pixi.toml` and `pixi.lock`, installs the locked conda packages of one environment into a prefix, slices that prefix into cacheable layers, stacks them on a base image pulled straight from a registry and writes an OCI image tarball.
