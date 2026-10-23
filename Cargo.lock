@@ -2602,8 +2602,10 @@ dependencies = [
  "rattler_cache",
  "rattler_conda_types",
  "rattler_config",
+ "rattler_digest",
  "rattler_lock",
  "rattler_networking",
+ "rattler_package_streaming",
  "rattler_shell",
  "reqwest",
  "rstest",
@@ -2619,6 +2621,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "walkdir",
 ]
 

@@ -460,6 +460,81 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
     assert_eq!(blobs, manifest.layers.len() + 2);
 }
 
+/// Write a noarch conda package `<name>-1.0-0.tar.bz2` with the file `share/<name>.txt`.
+fn write_conda_package(dir: &Path, name: &str, depends: &[&str]) -> PathBuf {
+    let contents = dir.join(format!("{name}-contents"));
+    fs::create_dir_all(contents.join("info")).unwrap();
+    fs::create_dir_all(contents.join("share")).unwrap();
+    let file = format!("share/{name}.txt");
+    fs::write(contents.join(&file), format!("hello from {name}\n")).unwrap();
+    let index = serde_json::json!({
+        "name": name, "version": "1.0", "build": "0", "build_number": 0,
+        "subdir": "noarch", "noarch": "generic", "depends": depends,
+    });
+    fs::write(contents.join("info/index.json"), index.to_string()).unwrap();
+    let paths = serde_json::json!({
+        "paths_version": 1,
+        "paths": [{ "_path": file, "path_type": "hardlink" }],
+    });
+    fs::write(contents.join("info/paths.json"), paths.to_string()).unwrap();
+    let archive = dir.join(format!("{name}-1.0-0.tar.bz2"));
+    rattler_package_streaming::write::write_tar_bz2_package(
+        fs::File::create(&archive).unwrap(),
+        &contents,
+        &["info/index.json", "info/paths.json", &file].map(|p| contents.join(p)),
+        rattler_conda_types::compression_level::CompressionLevel::Default,
+        None,
+        None,
+    )
+    .unwrap();
+    archive
+}
+
+#[rstest]
+#[tokio::test]
+async fn injects_local_packages(tmpdir: tempfile::TempDir) {
+    let package = write_conda_package(tmpdir.path(), "injected", &["caddy"]);
+    let out = tmpdir.path().join("example.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platform: Some("linux-64".to_string()),
+        output: Some(out.clone()),
+        inject: vec![package],
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+
+    let archive = Archive::open(&out);
+    archive.verify_digests();
+    let manifest = archive.manifest();
+    let files: HashMap<String, Vec<u8>> = manifest.layers[report.rootfs_layers..]
+        [..report.package_layers]
+        .iter()
+        .flat_map(|layer| archive.layer_entries(layer))
+        .map(|(name, _, data)| (name, data))
+        .collect();
+    assert_eq!(
+        files["opt/env/share/injected.txt"],
+        b"hello from injected\n"
+    );
+    assert!(files.contains_key("opt/env/conda-meta/injected-1.0-0.json"));
+    assert!(files.contains_key("opt/env/bin/caddy"));
+
+    // Dependencies of injected packages must be part of the environment.
+    let incompatible = write_conda_package(tmpdir.path(), "needs-new-caddy", &["caddy >=99"]);
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platform: Some("linux-64".to_string()),
+        output: Some(tmpdir.path().join("other.tar")),
+        inject: vec![incompatible],
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("caddy >=99"), "{err:#}");
+}
+
 #[rstest]
 fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
     let project = example_with_base(tmpdir.path(), "scratch");

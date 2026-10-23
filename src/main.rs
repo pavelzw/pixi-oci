@@ -56,6 +56,11 @@ struct BuildArgs {
     /// A pixi/rattler config file with mirrors or authentication settings.
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Inject an additional local conda package (`.conda` or `.tar.bz2`) into the environment.
+    /// Replaces a locked package of the same name. Can be given multiple times.
+    #[arg(short, long)]
+    inject: Vec<PathBuf>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -103,6 +108,7 @@ async fn main() -> Result<()> {
                 format: args.format.into(),
                 tag: args.tag,
                 rattler_config: args.config,
+                inject: args.inject,
             })
             .await?;
             tracing::info!(
