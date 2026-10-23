@@ -2,7 +2,13 @@
 name = "pixi-oci"
 channels = ["conda-forge"]
 exclude-newer = "7d"
-platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+platforms = [
+  "osx-arm64",
+  "osx-64",
+  "linux-64",
+  "linux-aarch64",
+  "linux-riscv64",
+]
 
 [tasks]
 build = "cargo build --release"

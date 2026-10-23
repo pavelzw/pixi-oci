@@ -40,6 +40,7 @@ jobs:
         os:
           - ubuntu-latest
           - ubuntu-24.04-arm
+          - ubuntu-24.04-riscv
           - macos-latest
     steps:
       - name: Checkout branch
