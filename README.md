@@ -16,6 +16,7 @@ pixi-oci build
 pixi-oci build --manifest-path app
 pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
 pixi-oci build --format oci-dir -o ./myapp
+pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -107,6 +108,16 @@ The image config carries everything `pixi shell-hook` would export: `PATH` with 
 When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a tiny wrapper to `<install-prefix>/etc/pixi-oci/entrypoint.sh` that sources them and then `exec`s your entrypoint. The wrapper is prepended to the entrypoint automatically and needs `activation-shell` to exist in the image: a scratch base has no shell, so add `bash` to the environment and point `activation-shell` at `<install-prefix>/bin/bash`.
 
 `[activation]` tables from the manifest (`env` and `scripts`) are not applied.
+
+### Inject additional packages
+
+`--inject` adds local conda packages (`.conda` or `.tar.bz2`) that are not part of `pixi.lock` to the environment. This is useful to put a freshly built package of your project into the image while still using the project's lockfile:
+
+```shell
+pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h1234567_0.conda
+```
+
+Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment.
 
 ## Limitations
 
