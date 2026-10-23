@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2](https://github.com/pavelzw/pixi-oci/compare/v0.1.1...v0.1.2) - 2026-10-23
+
+### Documentation
+
+- Add crates.io badge to README ([#20](https://github.com/pavelzw/pixi-oci/pull/20))
+
 ## [0.1.1](https://github.com/pavelzw/pixi-oci/compare/v0.1.0...v0.1.1) - 2026-10-23
 
 ### Features
