@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
 use pixi_oci::{BuildOptions, OutputFormat};
+use rattler_conda_types::PackageName;
 
 /// Build OCI images from pixi environments, without a container daemon.
 #[derive(Parser, Debug)]
@@ -61,6 +62,16 @@ struct BuildArgs {
     /// Replaces a locked package of the same name. Can be given multiple times.
     #[arg(short, long)]
     inject: Vec<PathBuf>,
+
+    /// Leave a locked conda package out of the environment. Combine with `--inject` to replace
+    /// a source package with a package built by `pixi build`. Can be given multiple times.
+    #[arg(long, value_name = "PACKAGE")]
+    skip: Vec<PackageName>,
+
+    /// Don't check that the dependencies and constraints of all packages are satisfied by the
+    /// environment, e.g. after `--skip` or `--inject`.
+    #[arg(long)]
+    skip_validation: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -109,6 +120,8 @@ async fn main() -> Result<()> {
                 tag: args.tag,
                 rattler_config: args.config,
                 inject: args.inject,
+                skip: args.skip,
+                skip_validation: args.skip_validation,
             })
             .await?;
             tracing::info!(

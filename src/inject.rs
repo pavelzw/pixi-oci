@@ -42,8 +42,7 @@ pub fn injected_record(path: &Path) -> Result<RepoDataRecord> {
 }
 
 /// Add the packages at `paths` to the locked `records`. An injected package replaces a locked
-/// package of the same name. Fails when a package is built for another platform, or when the
-/// dependencies and constraints of the resulting environment are not satisfied.
+/// package of the same name. Fails when a package is built for another platform.
 pub fn inject_packages(
     records: &mut Vec<RepoDataRecord>,
     paths: &[impl AsRef<Path>],
@@ -91,9 +90,14 @@ pub fn inject_packages(
         records.push(record);
     }
 
+    Ok(())
+}
+
+/// Check that the dependencies and constraints of all `records` are satisfied by `records`.
+pub fn validate_environment(records: &[RepoDataRecord]) -> Result<()> {
     PackageRecord::validate(records.iter().map(|r| &r.package_record).collect())
         .map_err(|e| anyhow!(e))
-        .context("the injected packages are not compatible with the environment")
+        .context("the environment is inconsistent")
 }
 
 #[cfg(test)]
@@ -190,7 +194,9 @@ mod tests {
     fn rejects_unsatisfied_dependencies() {
         let dir = tempfile::tempdir().unwrap();
         let foo = write_package(dir.path(), "foo", "noarch", &["bar >=3"]);
-        let err = inject_packages(&mut vec![locked("bar")], &[foo], Subdir::Linux64).unwrap_err();
+        let mut records = vec![locked("bar")];
+        inject_packages(&mut records, &[foo], Subdir::Linux64).unwrap();
+        let err = validate_environment(&records).unwrap_err();
         assert!(format!("{err:#}").contains("bar >=3"), "{err:#}");
     }
 

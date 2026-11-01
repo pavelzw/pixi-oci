@@ -18,6 +18,7 @@ pixi-oci build --manifest-path app
 pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
 pixi-oci build --format oci-dir -o ./myapp
 pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
+pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -118,13 +119,22 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h1234567_0.conda
 ```
 
-Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment.
+Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment. Pass `--skip-validation` to build anyway.
+
+### Skip locked packages
+
+`--skip <name>` leaves a locked conda package out of the environment. Combined with `--inject`, this puts a pixi-build source package into the image, which `pixi-oci` can't build itself:
+
+```shell
+pixi build --target-platform linux-64 --output-dir dist
+pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
+```
 
 ## Limitations
 
 - PyPI dependencies in the lockfile are rejected. Use conda packages for now.
 - Only `[tool.pixi-oci]` is read from the manifest. `[activation]` tables are ignored, and `pixi.lock` is not checked against the manifest, so run `pixi lock` after changing dependencies.
-- Source packages (pixi-build) are not yet supported.
+- Source packages (pixi-build) are not built; build them with `pixi build` and use `--skip` with `--inject`.
 - One platform per build; there is no multi-arch index yet.
 - `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.
 
