@@ -536,6 +536,45 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
 }
 
 #[rstest]
+#[tokio::test]
+async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
+    // A skipped package can be replaced by an injected one of the same name.
+    let caddy = write_conda_package(tmpdir.path(), "caddy", &[]);
+    let out = tmpdir.path().join("example.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platform: Some("linux-64".to_string()),
+        output: Some(out.clone()),
+        inject: vec![caddy],
+        skip: vec!["caddy".parse().unwrap()],
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+    let archive = Archive::open(&out);
+    let files: HashMap<String, Vec<u8>> = archive.manifest().layers[report.rootfs_layers..]
+        [..report.package_layers]
+        .iter()
+        .flat_map(|layer| archive.layer_entries(layer))
+        .map(|(name, _, data)| (name, data))
+        .collect();
+    assert_eq!(files["opt/env/share/caddy.txt"], b"hello from caddy\n");
+    assert!(!files.contains_key("opt/env/bin/caddy"));
+
+    // Skipping a dependency of another package leaves the environment broken.
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platform: Some("linux-64".to_string()),
+        output: Some(tmpdir.path().join("other.tar")),
+        skip: vec!["libexpat".parse().unwrap()],
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("libexpat"), "{err:#}");
+}
+
+#[rstest]
 fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
     let project = example_with_base(tmpdir.path(), "scratch");
     let mut digests = Vec::new();

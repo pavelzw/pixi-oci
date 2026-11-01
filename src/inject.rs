@@ -91,9 +91,15 @@ pub fn inject_packages(
         records.push(record);
     }
 
+    validate_environment(records)
+        .context("the injected packages are not compatible with the environment")
+}
+
+/// Check that the dependencies and constraints of all `records` are satisfied by `records`.
+pub fn validate_environment(records: &[RepoDataRecord]) -> Result<()> {
     PackageRecord::validate(records.iter().map(|r| &r.package_record).collect())
         .map_err(|e| anyhow!(e))
-        .context("the injected packages are not compatible with the environment")
+        .context("the environment is inconsistent")
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Arch;
 use ocidir::{OciDir, cap_std};
-use rattler_conda_types::Subdir;
+use rattler_conda_types::{PackageName, Subdir};
 use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
 
 use crate::{
@@ -37,7 +37,7 @@ use crate::{
         DEFAULT_TAG, LoadedManifest,
     },
     image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
-    inject::inject_packages,
+    inject::{inject_packages, validate_environment},
     install::{install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
@@ -70,6 +70,8 @@ pub struct BuildOptions {
     pub rattler_config: Option<PathBuf>,
     /// Local conda packages (`.conda` or `.tar.bz2`) to add to the locked environment.
     pub inject: Vec<PathBuf>,
+    /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
+    pub skip: Vec<PackageName>,
 }
 
 /// Summary of a finished build.
@@ -174,10 +176,15 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         &lockfile_path,
         &environment,
         options.platform.as_deref().or(cfg.platform.as_deref()),
+        &options.skip,
     )?;
     let subdir = locked.subdir;
     let platform = target_platform(subdir)?;
     inject_packages(&mut locked.records, &options.inject, subdir)?;
+    if options.inject.is_empty() && !options.skip.is_empty() {
+        // Other packages may depend on a skipped one.
+        validate_environment(&locked.records)?;
+    }
     eprintln!(
         "🔧 Building {reference} for {} (environment `{environment}`, {} packages)",
         subdir.as_str(),
