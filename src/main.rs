@@ -67,6 +67,11 @@ struct BuildArgs {
     /// a source package with a package built by `pixi build`. Can be given multiple times.
     #[arg(long, value_name = "PACKAGE")]
     skip: Vec<PackageName>,
+
+    /// Don't check that the dependencies and constraints of all packages are satisfied by the
+    /// environment, e.g. after `--skip` or `--inject`.
+    #[arg(long)]
+    skip_validation: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -116,6 +121,7 @@ async fn main() -> Result<()> {
                 rattler_config: args.config,
                 inject: args.inject,
                 skip: args.skip,
+                skip_validation: args.skip_validation,
             })
             .await?;
             tracing::info!(

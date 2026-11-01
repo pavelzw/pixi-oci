@@ -572,6 +572,18 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
     .await
     .unwrap_err();
     assert!(format!("{err:#}").contains("libexpat"), "{err:#}");
+
+    // Unless validation is skipped.
+    pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platform: Some("linux-64".to_string()),
+        output: Some(tmpdir.path().join("unvalidated.tar")),
+        skip: vec!["libexpat".parse().unwrap()],
+        skip_validation: true,
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds without validation");
 }
 
 #[rstest]

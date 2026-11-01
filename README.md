@@ -119,7 +119,7 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h1234567_0.conda
 ```
 
-Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment.
+Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment. Pass `--skip-validation` to build anyway.
 
 ### Skip locked packages
 
@@ -129,8 +129,6 @@ Injected packages must be built for the target platform or `noarch`. A locked pa
 pixi build --target-platform linux-64 --output-dir dist
 pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 ```
-
-Every skipped name must match a locked conda package. When nothing is injected, `pixi-oci` still checks that no other package depends on a skipped one.
 
 ## Limitations
 

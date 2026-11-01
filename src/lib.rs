@@ -72,6 +72,8 @@ pub struct BuildOptions {
     pub inject: Vec<PathBuf>,
     /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
     pub skip: Vec<PackageName>,
+    /// Don't check that the dependencies and constraints of all packages are satisfied.
+    pub skip_validation: bool,
 }
 
 /// Summary of a finished build.
@@ -181,8 +183,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let subdir = locked.subdir;
     let platform = target_platform(subdir)?;
     inject_packages(&mut locked.records, &options.inject, subdir)?;
-    if options.inject.is_empty() && !options.skip.is_empty() {
-        // Other packages may depend on a skipped one.
+    if !options.skip_validation {
         validate_environment(&locked.records)?;
     }
     eprintln!(

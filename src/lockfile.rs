@@ -82,10 +82,8 @@ pub fn load_locked_environment(
                 })
             }
             LockedPackage::Conda(CondaPackageData::Source(source)) => Err(anyhow!(
-                "source package {name} ({location}) is not supported; build it with `pixi build` \
-                 and pass `--skip {name} --inject <package>`",
-                name = source.name().as_source(),
-                location = source.location
+                "source package {} is not supported",
+                source.location
             )),
             LockedPackage::Pypi(_) => Err(anyhow!(
                 "PyPI package {} is not supported, use conda packages instead",
@@ -238,7 +236,7 @@ packages:
     #[test]
     fn rejects_source_packages() {
         let err = load(&[]).unwrap_err();
-        assert!(err.to_string().contains("--skip myapp"), "{err}");
+        assert!(err.to_string().contains("source package"), "{err}");
     }
 
     #[test]
