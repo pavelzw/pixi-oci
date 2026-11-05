@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use rattler_conda_types::{RepoDataRecord, Subdir};
+use rattler_conda_types::{PackageName, RepoDataRecord, Subdir};
 use rattler_lock::{CondaPackageData, LockFile, LockedPackage};
 
 /// The conda packages locked for one environment on one platform.
@@ -19,10 +19,14 @@ pub struct LockedEnvironment {
 /// Platform resolution order: the explicit request (a lockfile platform name or a conda
 /// subdir), then the current platform if it is linux, then the single linux platform of the
 /// environment. Non-linux platforms are rejected.
+///
+/// Conda packages named in `skip` are left out, including source packages, which can't be
+/// installed otherwise. Every name in `skip` must match a locked conda package.
 pub fn load_locked_environment(
     lockfile_path: &Path,
     environment: &str,
     requested_platform: Option<&str>,
+    skip: &[PackageName],
 ) -> Result<LockedEnvironment> {
     let lockfile = LockFile::from_path(lockfile_path)
         .with_context(|| format!("could not read lockfile {}", lockfile_path.display()))?;
@@ -56,7 +60,21 @@ pub fn load_locked_environment(
         )
     })?;
 
+    let mut skipped = vec![false; skip.len()];
     let records = packages
+        .filter(|package| {
+            let Some(name) = package.as_conda().map(CondaPackageData::name) else {
+                return true;
+            };
+            match skip.iter().position(|s| s == name) {
+                Some(i) => {
+                    skipped[i] = true;
+                    eprintln!("⏭️  Skipping {}", name.as_source());
+                    false
+                }
+                None => true,
+            }
+        })
         .map(|package| match package {
             LockedPackage::Conda(CondaPackageData::Binary(binary)) => {
                 RepoDataRecord::try_from(&**binary).with_context(|| {
@@ -73,6 +91,20 @@ pub fn load_locked_environment(
             )),
         })
         .collect::<Result<Vec<_>>>()?;
+
+    let unmatched: Vec<_> = skip
+        .iter()
+        .zip(&skipped)
+        .filter(|(_, skipped)| !**skipped)
+        .map(|(name, _)| name.as_source())
+        .collect();
+    if !unmatched.is_empty() {
+        bail!(
+            "cannot skip {}: not a conda package of environment `{environment}` on {}",
+            unmatched.join(", "),
+            subdir.as_str()
+        );
+    }
 
     Ok(LockedEnvironment {
         environment: environment.to_string(),
@@ -155,4 +187,73 @@ fn platform_choices(environment: &rattler_lock::Environment<'_>) -> String {
         .collect();
     choices.sort_unstable();
     choices.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCKFILE: &str = r#"version: 7
+platforms:
+- name: linux-64
+environments:
+  default:
+    channels:
+    - url: https://conda.anaconda.org/conda-forge/
+    packages:
+      linux-64:
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/caddy-2.11.7-hfc2019e_0.conda
+      - conda_source: myapp[0123abcd] @ .
+packages:
+- conda: https://conda.anaconda.org/conda-forge/linux-64/caddy-2.11.7-hfc2019e_0.conda
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  md5: 00000000000000000000000000000000
+  license: Apache-2.0
+  size: 1
+  timestamp: 1
+- conda_source: myapp[0123abcd] @ .
+  variants:
+    target_platform: noarch
+  depends:
+  - caddy
+"#;
+
+    fn load(skip: &[&str]) -> Result<LockedEnvironment> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pixi.lock");
+        std::fs::write(&path, LOCKFILE).unwrap();
+        let skip: Vec<_> = skip.iter().map(|s| s.parse().unwrap()).collect();
+        load_locked_environment(&path, "default", None, &skip)
+    }
+
+    fn names(env: &LockedEnvironment) -> Vec<&str> {
+        env.records
+            .iter()
+            .map(|r| r.package_record.name.as_normalized())
+            .collect()
+    }
+
+    #[test]
+    fn rejects_source_packages() {
+        let err = load(&[]).unwrap_err();
+        assert!(err.to_string().contains("source package"), "{err}");
+    }
+
+    #[test]
+    fn skips_source_packages() {
+        let env = load(&["myapp"]).unwrap();
+        assert_eq!(names(&env), ["caddy"]);
+    }
+
+    #[test]
+    fn skips_binary_packages() {
+        let env = load(&["myapp", "caddy"]).unwrap();
+        assert!(names(&env).is_empty());
+    }
+
+    #[test]
+    fn rejects_unknown_skipped_packages() {
+        let err = load(&["myapp", "nope"]).unwrap_err();
+        assert!(err.to_string().contains("cannot skip nope"), "{err}");
+    }
 }

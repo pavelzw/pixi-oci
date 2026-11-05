@@ -7,8 +7,10 @@
 pub mod activation;
 pub mod archive;
 pub mod base_image;
+pub mod cleanup;
 pub mod config;
 pub mod image;
+pub mod inject;
 pub mod install;
 pub mod layers;
 pub mod lockfile;
@@ -19,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::Arch;
 use ocidir::{OciDir, cap_std};
-use rattler_conda_types::Subdir;
+use rattler_conda_types::{PackageName, Subdir};
 use rattler_lock::DEFAULT_ENVIRONMENT_NAME;
 
 use crate::{
@@ -29,11 +31,13 @@ use crate::{
         write_oci_archive,
     },
     base_image::{TargetPlatform, fetch_base_image},
+    cleanup::{PartialFile, TempDir},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
         DEFAULT_TAG, LoadedManifest,
     },
     image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
+    inject::{inject_packages, validate_environment},
     install::{install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::load_locked_environment,
@@ -64,6 +68,12 @@ pub struct BuildOptions {
     pub tag: Option<String>,
     /// A rattler/pixi config file (mirrors, authentication).
     pub rattler_config: Option<PathBuf>,
+    /// Local conda packages (`.conda` or `.tar.bz2`) to add to the locked environment.
+    pub inject: Vec<PathBuf>,
+    /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
+    pub skip: Vec<PackageName>,
+    /// Don't check that the dependencies and constraints of all packages are satisfied.
+    pub skip_validation: bool,
 }
 
 /// Summary of a finished build.
@@ -164,13 +174,18 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .map_err(|e| anyhow!("invalid image reference `{reference}`: {e}"))?;
 
     let lockfile_path = loaded.dir.join("pixi.lock");
-    let locked = load_locked_environment(
+    let mut locked = load_locked_environment(
         &lockfile_path,
         &environment,
         options.platform.as_deref().or(cfg.platform.as_deref()),
+        &options.skip,
     )?;
     let subdir = locked.subdir;
     let platform = target_platform(subdir)?;
+    inject_packages(&mut locked.records, &options.inject, subdir)?;
+    if !options.skip_validation {
+        validate_environment(&locked.records)?;
+    }
     eprintln!(
         "🔧 Building {reference} for {} (environment `{environment}`, {} packages)",
         subdir.as_str(),
@@ -206,10 +221,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             output_path.clone()
         }
         OutputFormat::OciTar => {
-            layout_tmp = tempfile::Builder::new()
-                .prefix("pixi-oci-layout-")
-                .tempdir()
-                .context("could not create a temporary directory")?;
+            layout_tmp = TempDir::new("pixi-oci-layout-")?;
             layout_tmp.path().to_path_buf()
         }
     };
@@ -221,10 +233,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 
     // Fetch the base while nothing else needs the network heavily: pull the registry image, or
     // assemble the root filesystem for a scratch base.
-    let rootfs_staging = tempfile::Builder::new()
-        .prefix("pixi-oci-rootfs-")
-        .tempdir()
-        .context("could not create a temporary directory")?;
+    let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match &base_spec {
         BaseSpec::Image(image) => (
             fetch_base_image(image, &platform, &output_oci).await?,
@@ -237,10 +246,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     };
 
     // Install the environment into a staging directory mirroring the in-image layout.
-    let staging = tempfile::Builder::new()
-        .prefix("pixi-oci-")
-        .tempdir()
-        .context("could not create a temporary directory")?;
+    let staging = TempDir::new("pixi-oci-")?;
     let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
     std::fs::create_dir_all(&staging_prefix)?;
     let packages = locked.records.len();
@@ -362,7 +368,11 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             } else {
                 Output::File(output_path.clone())
             };
+            let partial = (!to_stdout).then(|| PartialFile::new(output_path.clone()));
             let bytes = write_oci_archive(&layout_dir, &destination)?;
+            if let Some(partial) = partial {
+                partial.keep();
+            }
             if to_stdout {
                 eprintln!("✅ Wrote {reference} ({bytes} bytes) to stdout");
                 None

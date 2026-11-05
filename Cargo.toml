@@ -1,6 +1,6 @@
 [package]
 name = "pixi-oci"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 description = "Build OCI images from pixi environments without a container daemon"
 license = "BSD-3-Clause"
@@ -51,16 +51,18 @@ rattler_cache = { version = "0.10.19", default-features = false }
 rattler_conda_types = "0.57.0"
 rattler_config = "0.9.3"
 rattler_lock = "0.34.7"
+rattler_digest = { version = "2.1.0", default-features = false }
 rattler_networking = { version = "0.34.1", default-features = false, features = [
   "dirs",
   "rattler_config",
 ] }
+rattler_package_streaming = { version = "0.27.14", default-features = false }
 rattler_shell = "0.29.4"
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 reqwest-middleware = { package = "astral-reqwest-middleware", version = "0.5" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 shlex = "2.0"
 tar = "0.4"
@@ -70,15 +72,17 @@ tokio = { version = "1", features = [
   "macros",
   "fs",
   "io-util",
+  "signal",
 ] }
 toml = "1.1"
+url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
 
 [dev-dependencies]
 assert_cmd = "2.2"
-rstest = "0.27"
+rstest = "0.28"
 
 [profile.release]
 codegen-units = 1
@@ -90,6 +94,6 @@ opt-level = "z"
 liblzma = { version = "0.4", default-features = false, features = [
   "static",
 ], optional = true }
-sha1 = { version = "0.10", optional = true }
+sha1 = { version = "0.11", optional = true }
 tar = { version = "0.4", optional = true }
 ureq = { version = "3", optional = true }

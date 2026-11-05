@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
 use pixi_oci::{BuildOptions, OutputFormat};
+use rattler_conda_types::PackageName;
 
 /// Build OCI images from pixi environments, without a container daemon.
 #[derive(Parser, Debug)]
@@ -56,6 +57,21 @@ struct BuildArgs {
     /// A pixi/rattler config file with mirrors or authentication settings.
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Inject an additional local conda package (`.conda` or `.tar.bz2`) into the environment.
+    /// Replaces a locked package of the same name. Can be given multiple times.
+    #[arg(short, long)]
+    inject: Vec<PathBuf>,
+
+    /// Leave a locked conda package out of the environment. Combine with `--inject` to replace
+    /// a source package with a package built by `pixi build`. Can be given multiple times.
+    #[arg(long, value_name = "PACKAGE")]
+    skip: Vec<PackageName>,
+
+    /// Don't check that the dependencies and constraints of all packages are satisfied by the
+    /// environment, e.g. after `--skip` or `--inject`.
+    #[arg(long)]
+    skip_validation: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -83,6 +99,16 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Ctrl-C would otherwise leave the staging directories (often gigabytes) and a partial
+    // output behind, as the process is terminated without running destructors.
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n🛑 Interrupted, cleaning up");
+            let _guard = pixi_oci::cleanup::clean_up();
+            std::process::exit(130);
+        }
+    });
+
     match cli.command {
         Command::Build(args) => {
             let report = pixi_oci::build(BuildOptions {
@@ -93,6 +119,9 @@ async fn main() -> Result<()> {
                 format: args.format.into(),
                 tag: args.tag,
                 rattler_config: args.config,
+                inject: args.inject,
+                skip: args.skip,
+                skip_validation: args.skip_validation,
             })
             .await?;
             tracing::info!(

@@ -2,6 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/pavelzw/pixi-oci/ci.yml?style=flat-square&branch=main)](https://github.com/pavelzw/pixi-oci/actions/workflows/ci.yml)
 [![Conda Platform](https://img.shields.io/conda/vn/conda-forge/pixi-oci?style=flat-square)](https://prefix.dev/channels/conda-forge/packages/pixi-oci)
+[![Crates.io](https://img.shields.io/crates/v/pixi-oci?style=flat-square)](https://crates.io/crates/pixi-oci)
 
 Build OCI container images from [pixi](https://pixi.sh) environments, without Docker, BuildKit or any other daemon.
 
@@ -16,6 +17,8 @@ pixi-oci build
 pixi-oci build --manifest-path app
 pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
 pixi-oci build --format oci-dir -o ./myapp
+pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
+pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -108,11 +111,30 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 
 `[activation]` tables from the manifest (`env` and `scripts`) are not applied.
 
+### Inject additional packages
+
+`--inject` adds local conda packages (`.conda` or `.tar.bz2`) that are not part of `pixi.lock` to the environment. This is useful to put a freshly built package of your project into the image while still using the project's lockfile:
+
+```shell
+pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h1234567_0.conda
+```
+
+Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment. Pass `--skip-validation` to build anyway.
+
+### Skip locked packages
+
+`--skip <name>` leaves a locked conda package out of the environment. Combined with `--inject`, this puts a pixi-build source package into the image, which `pixi-oci` can't build itself:
+
+```shell
+pixi build --target-platform linux-64 --output-dir dist
+pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
+```
+
 ## Limitations
 
 - PyPI dependencies in the lockfile are rejected. Use conda packages for now.
 - Only `[tool.pixi-oci]` is read from the manifest. `[activation]` tables are ignored, and `pixi.lock` is not checked against the manifest, so run `pixi lock` after changing dependencies.
-- Source packages (pixi-build) are not yet supported.
+- Source packages (pixi-build) are not built; build them with `pixi build` and use `--skip` with `--inject`.
 - One platform per build; there is no multi-arch index yet.
 - `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.
 

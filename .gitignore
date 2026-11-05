@@ -113,3 +113,6 @@ $RECYCLE.BIN/
 
 # build outputs
 *.tar
+
+# cargo-mutants output
+mutants.out*/
