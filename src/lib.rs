@@ -19,6 +19,7 @@ pub mod rootfs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+pub use inject::InjectSpec;
 use oci_spec::image::Arch;
 use ocidir::{OciDir, cap_std};
 use rattler_conda_types::{PackageName, Subdir};
@@ -36,11 +37,14 @@ use crate::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
         DEFAULT_TAG, LoadedManifest,
     },
-    image::{AssembleInputs, assemble_image, created_timestamp, merge_config, prepend_entrypoint},
+    image::{
+        AssembleInputs, AssembledImage, assemble_image, created_timestamp, merge_config,
+        prepend_entrypoint, write_index,
+    },
     inject::{inject_packages, validate_environment},
     install::{install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
-    lockfile::load_locked_environment,
+    lockfile::{LockedEnvironment, load_locked_environments},
     rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
 };
 
@@ -60,7 +64,8 @@ pub struct BuildOptions {
     /// `pixi.toml`, `pyproject.toml` or the directory containing it.
     pub manifest_path: PathBuf,
     pub environment: Option<String>,
-    pub platform: Option<String>,
+    /// Platforms to build for; more than one builds a multi-platform image.
+    pub platforms: Vec<String>,
     /// Output path; `-` writes the tarball to stdout. Defaults to `<name>.tar` / `<name>/`.
     pub output: Option<PathBuf>,
     pub format: OutputFormat,
@@ -69,7 +74,7 @@ pub struct BuildOptions {
     /// A rattler/pixi config file (mirrors, authentication).
     pub rattler_config: Option<PathBuf>,
     /// Local conda packages (`.conda` or `.tar.bz2`) to add to the locked environment.
-    pub inject: Vec<PathBuf>,
+    pub inject: Vec<InjectSpec>,
     /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
     pub skip: Vec<PackageName>,
     /// Don't check that the dependencies and constraints of all packages are satisfied.
@@ -81,6 +86,15 @@ pub struct BuildOptions {
 pub struct BuildReport {
     pub output: Option<PathBuf>,
     pub reference: String,
+    /// The image index of a multi-platform build.
+    pub index_digest: Option<String>,
+    /// One image per platform, in the requested order.
+    pub images: Vec<ImageReport>,
+}
+
+/// Summary of the image for one platform.
+#[derive(Debug, Clone)]
+pub struct ImageReport {
     pub subdir: Subdir,
     pub manifest_digest: String,
     pub config_digest: String,
@@ -132,6 +146,30 @@ fn open_dir(path: &Path) -> Result<cap_std::fs::Dir> {
         .with_context(|| format!("could not open {}", path.display()))
 }
 
+/// Settings shared by the images of all platforms.
+struct BuildContext<'a> {
+    loaded: &'a LoadedManifest,
+    cfg: &'a config::PixiOciConfig,
+    environment: &'a str,
+    install_prefix: &'a str,
+    max_layers: std::num::NonZeroUsize,
+    base_spec: &'a BaseSpec,
+    activation_shell: &'a str,
+    inject: &'a [InjectSpec],
+    skip_validation: bool,
+    reference: &'a str,
+    cache_dir: &'a Path,
+    client: &'a reqwest_middleware::ClientWithMiddleware,
+    output_oci: &'a OciDir,
+    created: chrono::DateTime<chrono::Utc>,
+}
+
+/// The image of one platform, written to the output layout.
+struct PlatformImage {
+    report: ImageReport,
+    assembled: AssembledImage,
+}
+
 /// Run a build.
 pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let loaded = LoadedManifest::load(&options.manifest_path)?;
@@ -173,32 +211,52 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .parse()
         .map_err(|e| anyhow!("invalid image reference `{reference}`: {e}"))?;
 
+    let requested_platforms = if options.platforms.is_empty() {
+        cfg.platform
+            .as_ref()
+            .map(config::Platforms::to_vec)
+            .unwrap_or_default()
+    } else {
+        options.platforms.clone()
+    };
     let lockfile_path = loaded.dir.join("pixi.lock");
-    let mut locked = load_locked_environment(
+    let locked = load_locked_environments(
         &lockfile_path,
         &environment,
-        options.platform.as_deref().or(cfg.platform.as_deref()),
+        &requested_platforms,
         &options.skip,
     )?;
-    let subdir = locked.subdir;
-    let platform = target_platform(subdir)?;
-    inject_packages(&mut locked.records, &options.inject, subdir)?;
-    if !options.skip_validation {
-        validate_environment(&locked.records)?;
+    let multi_platform = locked.len() > 1;
+    // Check everything that doesn't need the network before downloading anything.
+    for spec in &options.inject {
+        if let Some(platform) = &spec.platform
+            && !locked
+                .iter()
+                .any(|l| spec.applies_to(&l.platform, l.subdir))
+        {
+            bail!(
+                "`--inject {platform}:{}` does not match any platform of this build ({})",
+                spec.path.display(),
+                locked
+                    .iter()
+                    .map(|l| l.platform.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
-    eprintln!(
-        "🔧 Building {reference} for {} (environment `{environment}`, {} packages)",
-        subdir.as_str(),
-        locked.records.len()
-    );
-
+    for l in &locked {
+        target_platform(l.subdir)?;
+    }
     if let BaseSpec::Scratch(scratch) = &base_spec {
         let glibc = scratch
             .glibc
             .debian_version()
             .map(upstream_glibc_version)
             .transpose()?;
-        check_glibc(&locked.records, glibc.as_ref())?;
+        for l in &locked {
+            check_glibc(&l.records, glibc.as_ref())?;
+        }
     }
 
     // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
@@ -231,12 +289,164 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
     let client = reqwest_client_from_config(&rattler_config)?;
 
+    let ctx = BuildContext {
+        loaded: &loaded,
+        cfg: &cfg,
+        environment: &environment,
+        install_prefix: &install_prefix,
+        max_layers,
+        base_spec: &base_spec,
+        activation_shell: &activation_shell,
+        inject: &options.inject,
+        skip_validation: options.skip_validation,
+        reference: &reference,
+        cache_dir: &cache_dir,
+        client: &client,
+        output_oci: &output_oci,
+        created: created_timestamp(),
+    };
+    let mut images = Vec::with_capacity(locked.len());
+    for locked in locked {
+        images.push(build_platform(&ctx, locked).await?);
+    }
+
+    let index = write_index(
+        &output_oci,
+        &layout_dir,
+        images
+            .iter()
+            .map(|i| i.assembled.manifest_descriptor.clone())
+            .collect(),
+        &reference,
+        &normalized_reference,
+    )?;
+    let index_digest = index.map(|d| d.digest().to_string());
+    let subdirs = images
+        .iter()
+        .map(|i| i.report.subdir.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let output = match options.format {
+        OutputFormat::OciDir => {
+            // index.json only references this build, so blobs of earlier builds are garbage.
+            let keep: Vec<&str> = index_digest
+                .iter()
+                .map(String::as_str)
+                .chain(images.iter().flat_map(|i| {
+                    [&i.report.manifest_digest, &i.report.config_digest]
+                        .into_iter()
+                        .map(String::as_str)
+                        .chain(
+                            i.assembled
+                                .manifest
+                                .layers()
+                                .iter()
+                                .map(|l| l.digest().as_ref()),
+                        )
+                }))
+                .collect();
+            let removed = prune_blobs(&layout_dir, &keep)?;
+            if removed > 0 {
+                tracing::info!("removed {removed} blobs of earlier builds");
+            }
+            eprintln!(
+                "✅ Wrote OCI layout for {subdirs} to {}",
+                output_path.display()
+            );
+            Some(output_path)
+        }
+        OutputFormat::OciTar => {
+            // The docker-archive format has no notion of platforms, so a multi-platform
+            // tarball is a plain OCI layout (like BuildKit's `type=oci`). Loading it with
+            // `docker load` needs the containerd image store.
+            if let [image] = images.as_slice() {
+                write_docker_manifest(
+                    &layout_dir,
+                    &DockerManifestEntry {
+                        config: blob_path(&image.report.config_digest),
+                        repo_tags: vec![reference.clone()],
+                        layers: image
+                            .assembled
+                            .manifest
+                            .layers()
+                            .iter()
+                            .map(|l| blob_path(l.digest().as_ref()))
+                            .collect(),
+                    },
+                )?;
+            }
+            let destination = if to_stdout {
+                Output::Stdout
+            } else {
+                Output::File(output_path.clone())
+            };
+            let partial = (!to_stdout).then(|| PartialFile::new(output_path.clone()));
+            let bytes = write_oci_archive(&layout_dir, &destination)?;
+            if let Some(partial) = partial {
+                partial.keep();
+            }
+            if to_stdout {
+                eprintln!("✅ Wrote {reference} for {subdirs} ({bytes} bytes) to stdout");
+                None
+            } else {
+                eprintln!(
+                    "✅ Wrote {reference} for {subdirs} ({bytes} bytes) to {}",
+                    output_path.display()
+                );
+                Some(output_path)
+            }
+        }
+    };
+    if multi_platform && options.format == OutputFormat::OciTar {
+        eprintln!(
+            "ℹ️  Multi-platform tarballs carry no docker-archive manifest.json; `docker load` \
+             needs the containerd image store"
+        );
+    }
+
+    Ok(BuildReport {
+        output,
+        reference,
+        index_digest,
+        images: images.into_iter().map(|i| i.report).collect(),
+    })
+}
+
+/// Install the environment for one platform and write its layers, config and manifest.
+async fn build_platform(
+    ctx: &BuildContext<'_>,
+    mut locked: LockedEnvironment,
+) -> Result<PlatformImage> {
+    let subdir = locked.subdir;
+    let platform = target_platform(subdir)?;
+    let inject: Vec<&Path> = ctx
+        .inject
+        .iter()
+        .filter(|spec| spec.applies_to(&locked.platform, subdir))
+        .map(|spec| spec.path.as_path())
+        .collect();
+    inject_packages(&mut locked.records, &inject, subdir)?;
+    if !ctx.skip_validation {
+        validate_environment(&locked.records)
+            .with_context(|| format!("invalid environment for {}", subdir.as_str()))?;
+    }
+    eprintln!(
+        "🔧 Building {} for {} (environment `{}`, {} packages)",
+        ctx.reference,
+        subdir.as_str(),
+        ctx.environment,
+        locked.records.len()
+    );
+
+    let client = ctx.client.clone();
+
     // Fetch the base while nothing else needs the network heavily: pull the registry image, or
     // assemble the root filesystem for a scratch base.
     let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
-    let (base, rootfs_layers) = match &base_spec {
+    let (base, rootfs_layers) = match ctx.base_spec {
         BaseSpec::Image(image) => (
-            fetch_base_image(image, &platform, &output_oci).await?,
+            fetch_base_image(image, &platform, ctx.output_oci).await?,
             Vec::new(),
         ),
         BaseSpec::Scratch(scratch) => (
@@ -247,17 +457,22 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 
     // Install the environment into a staging directory mirroring the in-image layout.
     let staging = TempDir::new("pixi-oci-")?;
-    let staging_prefix = staging.path().join(install_prefix.trim_start_matches('/'));
+    let staging_prefix = staging
+        .path()
+        .join(ctx.install_prefix.trim_start_matches('/'));
     std::fs::create_dir_all(&staging_prefix)?;
     let packages = locked.records.len();
-    eprintln!("⬇️  Installing {packages} packages into {install_prefix}");
+    eprintln!(
+        "⬇️  Installing {packages} packages into {}",
+        ctx.install_prefix
+    );
     install_environment(
         &staging_prefix,
-        &install_prefix,
+        ctx.install_prefix,
         subdir,
         locked.records,
         client,
-        &cache_dir,
+        ctx.cache_dir,
     )
     .await?;
 
@@ -271,7 +486,8 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .filter_map(|entry| entry.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    let user_env = cfg
+    let user_env = ctx
+        .cfg
         .oci_config
         .env
         .as_ref()
@@ -280,13 +496,14 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .unwrap_or_default();
     let activation = prepare_activation(ActivationInputs {
         staging_prefix: &staging_prefix,
-        install_prefix: &install_prefix,
+        install_prefix: ctx.install_prefix,
         subdir,
         base_env: &base_env,
         user_env: &user_env,
     })?;
 
-    let working_dir = cfg
+    let working_dir = ctx
+        .cfg
         .oci_config
         .working_dir
         .clone()
@@ -297,106 +514,45 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let rootfs_layer_count = layers.len();
     layers.extend(plan_package_layers(
         &staging_prefix,
-        &install_prefix,
-        &PopularitySplitter { max_layers },
+        ctx.install_prefix,
+        &PopularitySplitter {
+            max_layers: ctx.max_layers,
+        },
     )?);
     let package_layers = layers.len() - rootfs_layer_count;
-    let copy_layer = plan_copy_layer(&loaded.dir, &cfg.copy_to_image, &working_dir)?;
+    let copy_layer = plan_copy_layer(&ctx.loaded.dir, &ctx.cfg.copy_to_image, &working_dir)?;
     let has_copy_layer = copy_layer.is_some();
     layers.extend(copy_layer);
 
-    let mut user_config = cfg.oci_config.to_oci_config()?;
+    let mut user_config = ctx.cfg.oci_config.to_oci_config()?;
     // The activation env already contains the base image env and the user's env.
     user_config.set_env(Some(activation.env));
     let mut merged = merge_config(base_config, &user_config);
     if let Some(wrapper) = activation.wrapper {
-        prepend_entrypoint(&mut merged, vec![activation_shell, wrapper]);
+        prepend_entrypoint(&mut merged, vec![ctx.activation_shell.to_string(), wrapper]);
     }
 
     let assembled = assemble_image(AssembleInputs {
-        output: &output_oci,
-        output_dir: &layout_dir,
+        output: ctx.output_oci,
         base: base.as_ref(),
         layers: &layers,
         platform: &platform,
         config: merged,
-        created: created_timestamp(),
-        reference: &reference,
-        normalized_reference: &normalized_reference,
+        created: ctx.created,
     })?;
 
-    let manifest_digest = assembled.manifest_descriptor.digest().to_string();
-    let config_digest = assembled.config_descriptor.digest().to_string();
-
-    let output = match options.format {
-        OutputFormat::OciDir => {
-            // index.json only references this build, so blobs of earlier builds are garbage.
-            let keep: Vec<&str> = [&manifest_digest, &config_digest]
-                .into_iter()
-                .map(String::as_str)
-                .chain(
-                    assembled
-                        .manifest
-                        .layers()
-                        .iter()
-                        .map(|l| l.digest().as_ref()),
-                )
-                .collect();
-            let removed = prune_blobs(&layout_dir, &keep)?;
-            if removed > 0 {
-                tracing::info!("removed {removed} blobs of earlier builds");
-            }
-            eprintln!("✅ Wrote OCI layout to {}", output_path.display());
-            Some(output_path)
-        }
-        OutputFormat::OciTar => {
-            write_docker_manifest(
-                &layout_dir,
-                &DockerManifestEntry {
-                    config: blob_path(&config_digest),
-                    repo_tags: vec![reference.clone()],
-                    layers: assembled
-                        .manifest
-                        .layers()
-                        .iter()
-                        .map(|l| blob_path(l.digest().as_ref()))
-                        .collect(),
-                },
-            )?;
-            let destination = if to_stdout {
-                Output::Stdout
-            } else {
-                Output::File(output_path.clone())
-            };
-            let partial = (!to_stdout).then(|| PartialFile::new(output_path.clone()));
-            let bytes = write_oci_archive(&layout_dir, &destination)?;
-            if let Some(partial) = partial {
-                partial.keep();
-            }
-            if to_stdout {
-                eprintln!("✅ Wrote {reference} ({bytes} bytes) to stdout");
-                None
-            } else {
-                eprintln!(
-                    "✅ Wrote {reference} ({bytes} bytes) to {}",
-                    output_path.display()
-                );
-                Some(output_path)
-            }
-        }
-    };
-
-    Ok(BuildReport {
-        output,
-        reference,
-        subdir,
-        manifest_digest,
-        config_digest,
-        base_layers: base.as_ref().map_or(0, |b| b.layers.len()),
-        rootfs_layers: rootfs_layer_count,
-        package_layers,
-        copy_layer: has_copy_layer,
-        packages,
+    Ok(PlatformImage {
+        report: ImageReport {
+            subdir,
+            manifest_digest: assembled.manifest_descriptor.digest().to_string(),
+            config_digest: assembled.config_descriptor.digest().to_string(),
+            base_layers: base.as_ref().map_or(0, |b| b.layers.len()),
+            rootfs_layers: rootfs_layer_count,
+            package_layers,
+            copy_layer: has_copy_layer,
+            packages,
+        },
+        assembled,
     })
 }
 

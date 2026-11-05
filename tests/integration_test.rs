@@ -232,7 +232,7 @@ async fn build_example(
     };
     pixi_oci::build(BuildOptions {
         manifest_path,
-        platform: Some(platform.to_string()),
+        platforms: vec![platform.to_string()],
         output: Some(output.to_path_buf()),
         format,
         ..Default::default()
@@ -247,12 +247,12 @@ async fn builds_example_on_ubuntu(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("example.tar");
     let report = build_example(&out, "linux-64", Some("ubuntu"), OutputFormat::OciTar).await;
     assert_eq!(report.reference, "example-project:latest");
-    assert_eq!(report.rootfs_layers, 0);
+    assert_eq!(report.images[0].rootfs_layers, 0);
     // More packages than `max-layers = 20`, so the last package layer is shared.
-    assert!(report.packages > 20);
-    assert_eq!(report.package_layers, 20);
-    assert!(report.copy_layer);
-    assert!(report.base_layers >= 1);
+    assert!(report.images[0].packages > 20);
+    assert_eq!(report.images[0].package_layers, 20);
+    assert!(report.images[0].copy_layer);
+    assert!(report.images[0].base_layers >= 1);
 
     let archive = Archive::open(&out);
     archive.verify_digests();
@@ -276,7 +276,7 @@ async fn builds_example_on_ubuntu(tmpdir: tempfile::TempDir) {
     let manifest = archive.manifest();
     assert_eq!(
         manifest.layers.len(),
-        report.base_layers + report.package_layers + 1
+        report.images[0].base_layers + report.images[0].package_layers + 1
     );
     for layer in &manifest.layers {
         assert!(
@@ -372,13 +372,16 @@ async fn builds_glibc_rootfs_from_scratch(tmpdir: tempfile::TempDir) {
     // The example's `base` is a scratch table with glibc and the shadow setup.
     let out = tmpdir.path().join("example.tar");
     let report = build_example(&out, "linux-64", None, OutputFormat::OciTar).await;
-    assert_eq!(report.base_layers, 0);
-    assert_eq!(report.rootfs_layers, 2);
+    assert_eq!(report.images[0].base_layers, 0);
+    assert_eq!(report.images[0].rootfs_layers, 2);
 
     let archive = Archive::open(&out);
     archive.verify_digests();
     let manifest = archive.manifest();
-    assert_eq!(manifest.layers.len(), 2 + report.package_layers + 1);
+    assert_eq!(
+        manifest.layers.len(),
+        2 + report.images[0].package_layers + 1
+    );
     let history: Vec<_> = archive
         .config()
         .history
@@ -421,7 +424,7 @@ async fn builds_glibc_rootfs_from_scratch(tmpdir: tempfile::TempDir) {
 async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("layout");
     let report = build_example(&out, "linux-aarch64", Some("scratch"), OutputFormat::OciDir).await;
-    assert_eq!(report.base_layers, 0);
+    assert_eq!(report.images[0].base_layers, 0);
     assert!(out.join("oci-layout").is_file());
     assert!(!out.join("manifest.json").exists());
 
@@ -438,7 +441,7 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
         .unwrap()
     };
     let manifest: Manifest = serde_json::from_slice(&blob(&desc.digest)).unwrap();
-    let layers = report.package_layers + 1;
+    let layers = report.images[0].package_layers + 1;
     assert_eq!(manifest.layers.len(), layers);
     let config: ImageConfig = serde_json::from_slice(&blob(&manifest.config.digest)).unwrap();
     assert_eq!(config.architecture, "arm64");
@@ -455,7 +458,7 @@ async fn builds_from_scratch_for_aarch64_as_directory(tmpdir: tempfile::TempDir)
     let report = build_example(&out, "linux-64", Some("scratch"), OutputFormat::OciDir).await;
     let index: Index = serde_json::from_slice(&fs::read(out.join("index.json")).unwrap()).unwrap();
     let manifest: Manifest = serde_json::from_slice(&blob(&index.manifests[0].digest)).unwrap();
-    assert_eq!(manifest.layers.len(), report.package_layers + 1);
+    assert_eq!(manifest.layers.len(), report.images[0].package_layers + 1);
     let blobs = fs::read_dir(out.join("blobs/sha256")).unwrap().count();
     assert_eq!(blobs, manifest.layers.len() + 2);
 }
@@ -497,9 +500,9 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("example.tar");
     let report = pixi_oci::build(BuildOptions {
         manifest_path: example_with_base(tmpdir.path(), "scratch"),
-        platform: Some("linux-64".to_string()),
+        platforms: vec!["linux-64".to_string()],
         output: Some(out.clone()),
-        inject: vec![package],
+        inject: vec![package.into()],
         ..Default::default()
     })
     .await
@@ -508,8 +511,8 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
     let archive = Archive::open(&out);
     archive.verify_digests();
     let manifest = archive.manifest();
-    let files: HashMap<String, Vec<u8>> = manifest.layers[report.rootfs_layers..]
-        [..report.package_layers]
+    let files: HashMap<String, Vec<u8>> = manifest.layers[report.images[0].rootfs_layers..]
+        [..report.images[0].package_layers]
         .iter()
         .flat_map(|layer| archive.layer_entries(layer))
         .map(|(name, _, data)| (name, data))
@@ -525,14 +528,121 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
     let incompatible = write_conda_package(tmpdir.path(), "needs-new-caddy", &["caddy >=99"]);
     let err = pixi_oci::build(BuildOptions {
         manifest_path: example_with_base(tmpdir.path(), "scratch"),
-        platform: Some("linux-64".to_string()),
+        platforms: vec!["linux-64".to_string()],
         output: Some(tmpdir.path().join("other.tar")),
-        inject: vec![incompatible],
+        inject: vec![incompatible.into()],
         ..Default::default()
     })
     .await
     .unwrap_err();
     assert!(format!("{err:#}").contains("caddy >=99"), "{err:#}");
+}
+
+#[rstest]
+#[tokio::test]
+async fn builds_multi_platform_index(tmpdir: tempfile::TempDir) {
+    let everywhere = write_conda_package(tmpdir.path(), "everywhere", &[]);
+    let arm_only = write_conda_package(tmpdir.path(), "arm-only", &[]);
+    let out = tmpdir.path().join("example.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platforms: vec!["linux-64".to_string(), "linux-aarch64".to_string()],
+        output: Some(out.clone()),
+        inject: vec![
+            everywhere.into(),
+            format!("linux-aarch64:{}", arm_only.display())
+                .parse()
+                .unwrap(),
+        ],
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+    assert_eq!(report.images.len(), 2);
+
+    let archive = Archive::open(&out);
+    // docker-archive can't describe multi-platform images.
+    assert!(!archive.entries.contains_key("manifest.json"));
+
+    // index.json -> tagged image index -> one manifest per platform.
+    let index = archive.index();
+    assert_eq!(index.manifests.len(), 1);
+    let entry = &index.manifests[0];
+    assert_eq!(entry.media_type, "application/vnd.oci.image.index.v1+json");
+    assert_eq!(Some(&entry.digest), report.index_digest.as_ref());
+    assert_eq!(
+        entry.annotations["org.opencontainers.image.ref.name"],
+        "example-project:latest"
+    );
+    let nested: Index = serde_json::from_slice(archive.blob(&entry.digest)).unwrap();
+    let platforms: Vec<_> = nested
+        .manifests
+        .iter()
+        .map(|m| {
+            let p = m.platform.clone().unwrap();
+            (p.os, p.architecture, p.variant)
+        })
+        .collect();
+    assert_eq!(
+        platforms,
+        [
+            ("linux".to_string(), "amd64".to_string(), None),
+            (
+                "linux".to_string(),
+                "arm64".to_string(),
+                Some("v8".to_string())
+            ),
+        ]
+    );
+
+    let manifests: Vec<Manifest> = nested
+        .manifests
+        .iter()
+        .map(|m| serde_json::from_slice(archive.blob(&m.digest)).unwrap())
+        .collect();
+    let mut files = Vec::new();
+    for ((manifest, image), arch) in manifests.iter().zip(&report.images).zip(["amd64", "arm64"]) {
+        let config: ImageConfig =
+            serde_json::from_slice(archive.blob(&manifest.config.digest)).unwrap();
+        assert_eq!(config.architecture, arch);
+        assert_eq!(config.rootfs.diff_ids.len(), manifest.layers.len());
+        files.push(
+            manifest.layers[..image.package_layers]
+                .iter()
+                .flat_map(|layer| archive.layer_entries(layer))
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let has = |files: &[String], name: &str| files.iter().any(|f| f == name);
+    assert!(has(&files[0], "opt/env/share/everywhere.txt"));
+    assert!(has(&files[1], "opt/env/share/everywhere.txt"));
+    assert!(!has(&files[0], "opt/env/share/arm-only.txt"));
+    assert!(has(&files[1], "opt/env/share/arm-only.txt"));
+    // The copy layer is the same on every platform and stored once.
+    assert_eq!(
+        manifests[0].layers.last().unwrap().digest,
+        manifests[1].layers.last().unwrap().digest
+    );
+
+    // A platform-specific injection must name a platform of the build.
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: example_with_base(tmpdir.path(), "scratch"),
+        platforms: vec!["linux-64".to_string()],
+        output: Some(tmpdir.path().join("other.tar")),
+        inject: vec![
+            format!("linux-aarch64:{}", arm_only.display())
+                .parse()
+                .unwrap(),
+        ],
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("does not match any platform"),
+        "{err}"
+    );
 }
 
 #[rstest]
@@ -543,17 +653,17 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
     let out = tmpdir.path().join("example.tar");
     let report = pixi_oci::build(BuildOptions {
         manifest_path: example_with_base(tmpdir.path(), "scratch"),
-        platform: Some("linux-64".to_string()),
+        platforms: vec!["linux-64".to_string()],
         output: Some(out.clone()),
-        inject: vec![caddy],
+        inject: vec![caddy.into()],
         skip: vec!["caddy".parse().unwrap()],
         ..Default::default()
     })
     .await
     .expect("build succeeds");
     let archive = Archive::open(&out);
-    let files: HashMap<String, Vec<u8>> = archive.manifest().layers[report.rootfs_layers..]
-        [..report.package_layers]
+    let files: HashMap<String, Vec<u8>> = archive.manifest().layers
+        [report.images[0].rootfs_layers..][..report.images[0].package_layers]
         .iter()
         .flat_map(|layer| archive.layer_entries(layer))
         .map(|(name, _, data)| (name, data))
@@ -564,7 +674,7 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
     // Skipping a dependency of another package leaves the environment broken.
     let err = pixi_oci::build(BuildOptions {
         manifest_path: example_with_base(tmpdir.path(), "scratch"),
-        platform: Some("linux-64".to_string()),
+        platforms: vec!["linux-64".to_string()],
         output: Some(tmpdir.path().join("other.tar")),
         skip: vec!["libexpat".parse().unwrap()],
         ..Default::default()
@@ -576,7 +686,7 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
     // Unless validation is skipped.
     pixi_oci::build(BuildOptions {
         manifest_path: example_with_base(tmpdir.path(), "scratch"),
-        platform: Some("linux-64".to_string()),
+        platforms: vec!["linux-64".to_string()],
         output: Some(tmpdir.path().join("unvalidated.tar")),
         skip: vec!["libexpat".parse().unwrap()],
         skip_validation: true,

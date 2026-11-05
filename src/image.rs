@@ -101,20 +101,15 @@ pub fn prepend_entrypoint(config: &mut Config, prefix: Vec<String>) {
 /// Inputs for [`assemble_image`].
 pub struct AssembleInputs<'a> {
     pub output: &'a OciDir,
-    pub output_dir: &'a Path,
     pub base: Option<&'a BaseImage>,
     pub layers: &'a [PlannedLayer],
     pub platform: &'a TargetPlatform,
     pub config: Config,
     pub created: DateTime<Utc>,
-    /// `name:tag` as the user wrote it.
-    pub reference: &'a str,
-    /// `reference` with registry and namespace filled in, e.g. `docker.io/library/name:tag`.
-    pub normalized_reference: &'a Reference,
 }
 
-/// Reference the base layers (already in `output`), write the new layers, then config,
-/// manifest and index.
+/// Reference the base layers (already in `output`), write the new layers, then config and
+/// manifest. The manifest is referenced by [`write_index`] afterwards.
 pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
     let mut layer_descriptors: Vec<Descriptor> = Vec::new();
     let mut diff_ids: Vec<String> = Vec::new();
@@ -170,27 +165,57 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
         .layers(layer_descriptors)
         .build()?;
 
-    let annotations = HashMap::from([
-        (
-            REF_NAME_ANNOTATION.to_string(),
-            inputs.reference.to_string(),
-        ),
-        (
-            CONTAINERD_NAME_ANNOTATION.to_string(),
-            inputs.normalized_reference.whole(),
-        ),
-    ]);
     let manifest_descriptor = inputs
         .output
         .write_json_blob(&manifest, MediaType::ImageManifest)?
         .platform(inputs.platform.to_oci_platform()?)
-        .annotations(annotations)
         .build()?;
+
+    Ok(AssembledImage {
+        manifest,
+        manifest_descriptor,
+        config_descriptor,
+    })
+}
+
+/// Write `index.json` for the image(s) in `manifests`, tagged with `reference`.
+///
+/// A single manifest is referenced directly. Several manifests (one per platform) go into an
+/// image index blob that `index.json` references, like BuildKit's OCI exporter does, so the
+/// tag names the multi-platform image. Returns that nested index's descriptor, if any.
+pub fn write_index(
+    output: &OciDir,
+    output_dir: &Path,
+    manifests: Vec<Descriptor>,
+    reference: &str,
+    normalized_reference: &Reference,
+) -> Result<Option<Descriptor>> {
+    let (mut entry, nested) = match <[Descriptor; 1]>::try_from(manifests) {
+        Ok([manifest]) => (manifest, None),
+        Err(manifests) => {
+            let index = ImageIndexBuilder::default()
+                .schema_version(SCHEMA_VERSION)
+                .media_type(MediaType::ImageIndex)
+                .manifests(manifests)
+                .build()?;
+            let descriptor = output
+                .write_json_blob(&index, MediaType::ImageIndex)?
+                .build()?;
+            (descriptor.clone(), Some(descriptor))
+        }
+    };
+    entry.set_annotations(Some(HashMap::from([
+        (REF_NAME_ANNOTATION.to_string(), reference.to_string()),
+        (
+            CONTAINERD_NAME_ANNOTATION.to_string(),
+            normalized_reference.whole(),
+        ),
+    ])));
 
     let index = ImageIndexBuilder::default()
         .schema_version(SCHEMA_VERSION)
         .media_type(MediaType::ImageIndex)
-        .manifests(vec![manifest_descriptor.clone()])
+        .manifests(vec![entry])
         .build()?;
     // Canonical JSON keeps the key order stable, which keeps the tarball reproducible.
     let mut index_json = Vec::new();
@@ -198,14 +223,9 @@ pub fn assemble_image(inputs: AssembleInputs<'_>) -> Result<AssembledImage> {
         &mut index_json,
         canon_json::CanonicalFormatter::new(),
     ))?;
-    std::fs::write(inputs.output_dir.join("index.json"), index_json)
+    std::fs::write(output_dir.join("index.json"), index_json)
         .context("could not write index.json")?;
-
-    Ok(AssembledImage {
-        manifest,
-        manifest_descriptor,
-        config_descriptor,
-    })
+    Ok(nested)
 }
 
 #[cfg(test)]
