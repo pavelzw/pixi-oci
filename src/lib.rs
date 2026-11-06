@@ -226,7 +226,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         &requested_platforms,
         &options.skip,
     )?;
-    let multi_platform = locked.len() > 1;
     // Check everything that doesn't need the network before downloading anything.
     for spec in &options.inject {
         if let Some(platform) = &spec.platform
@@ -347,9 +346,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
                 }))
                 .collect();
             let removed = prune_blobs(&layout_dir, &keep)?;
-            if removed > 0 {
-                tracing::info!("removed {removed} blobs of earlier builds");
-            }
+            tracing::info!("removed {removed} blobs of earlier builds");
             eprintln!(
                 "✅ Wrote OCI layout for {subdirs} to {}",
                 output_path.display()
@@ -375,13 +372,20 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
                             .collect(),
                     },
                 )?;
-            }
-            let destination = if to_stdout {
-                Output::Stdout
             } else {
-                Output::File(output_path.clone())
+                eprintln!(
+                    "ℹ️  Multi-platform tarballs carry no docker-archive manifest.json; \
+                     `docker load` needs the containerd image store"
+                );
+            }
+            let (destination, partial) = if to_stdout {
+                (Output::Stdout, None)
+            } else {
+                (
+                    Output::File(output_path.clone()),
+                    Some(PartialFile::new(output_path.clone())),
+                )
             };
-            let partial = (!to_stdout).then(|| PartialFile::new(output_path.clone()));
             let bytes = write_oci_archive(&layout_dir, &destination)?;
             if let Some(partial) = partial {
                 partial.keep();
@@ -398,13 +402,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             }
         }
     };
-    if multi_platform && options.format == OutputFormat::OciTar {
-        eprintln!(
-            "ℹ️  Multi-platform tarballs carry no docker-archive manifest.json; `docker load` \
-             needs the containerd image store"
-        );
-    }
-
     Ok(BuildReport {
         output,
         reference,
