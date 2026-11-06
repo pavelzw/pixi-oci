@@ -3,9 +3,7 @@
 
 use std::{
     borrow::Cow,
-    ffi::OsStr,
     fs,
-    io::Read,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Component, Path, PathBuf},
     str::FromStr,
@@ -26,9 +24,6 @@ use crate::{
 /// Debian's snapshot archive. It keeps every package version ever published, so pinned
 /// versions stay downloadable (unlike the regular pool, which drops superseded versions).
 const SNAPSHOT_URL: &str = "https://snapshot.debian.org";
-/// Local `.deb` files (separated like `PATH`) used instead of downloading them, e.g. for
-/// offline builds. The `bundled-glibc` build reads the same variable.
-pub const LOCAL_DEBS_ENV: &str = "GLIBC_DEBIAN_FILE";
 
 const PASSWD: &str = "\
 root:x:0:0:root:/root:/bin/sh
@@ -134,14 +129,9 @@ pub async fn plan_rootfs_layers(
     let mut layers = Vec::new();
     if let Some(version) = base.glibc.debian_version() {
         let arch = debian_arch(subdir)?;
-        let local = std::env::var_os(LOCAL_DEBS_ENV)
-            .map(|files| local_deb(&files, "libc6", version, arch))
-            .transpose()?
-            .flatten();
-        let deb: Cow<'static, [u8]> = match (bundled_deb("libc6", version, arch), local) {
-            (Some(deb), _) => Cow::Borrowed(deb),
-            (None, Some(deb)) => Cow::Owned(deb),
-            (None, None) => Cow::Owned(fetch_deb(client, "libc6", version, arch).await?),
+        let deb: Cow<'static, [u8]> = match bundled_deb("libc6", version, arch) {
+            Some(deb) => Cow::Borrowed(deb),
+            None => Cow::Owned(fetch_deb(client, "libc6", version, arch).await?),
         };
         let root = staging.join("glibc");
         extract_deb(&deb, &root, keep_glibc_file)
@@ -303,53 +293,6 @@ async fn fetch_deb(
     Ok(data.to_vec())
 }
 
-/// The first of the `.deb` files in `files` (separated like `PATH`) that is `package`
-/// `version` for `arch`.
-fn local_deb(files: &OsStr, package: &str, version: &str, arch: &str) -> Result<Option<Vec<u8>>> {
-    for path in std::env::split_paths(files) {
-        let data = fs::read(&path)
-            .with_context(|| format!("{LOCAL_DEBS_ENV}: could not read {}", path.display()))?;
-        let control = deb_control(&data).with_context(|| {
-            format!(
-                "{LOCAL_DEBS_ENV}: invalid Debian package {}",
-                path.display()
-            )
-        })?;
-        let field = |name: &str| {
-            control
-                .lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
-                .map(str::trim)
-        };
-        if field("Package") == Some(package)
-            && field("Version") == Some(version)
-            && field("Architecture") == Some(arch)
-        {
-            eprintln!(
-                "📂 Using {package} {version} ({arch}) from {}",
-                path.display()
-            );
-            return Ok(Some(data));
-        }
-    }
-    Ok(None)
-}
-
-/// The `control` file of a `.deb`.
-fn deb_control(deb: &[u8]) -> Result<String> {
-    let control_tar = ar_member(deb, "control.tar.xz")?;
-    let mut archive = tar::Archive::new(liblzma::read::XzDecoder::new(control_tar));
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if entry.path()?.file_name().is_some_and(|f| f == "control") {
-            let mut text = String::new();
-            entry.read_to_string(&mut text)?;
-            return Ok(text);
-        }
-    }
-    bail!("no control file in control.tar.xz")
-}
-
 /// Unpack the `data.tar.xz` of a `.deb` into `dest`, keeping only the paths `keep` accepts.
 /// Directories are created as needed rather than taken from the archive.
 fn extract_deb(deb: &[u8], dest: &Path, keep: impl Fn(&Path) -> bool) -> Result<()> {
@@ -448,10 +391,10 @@ mod tests {
         )));
     }
 
-    /// An `ar` archive with the members `members`.
-    fn ar_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+    #[test]
+    fn parses_ar_archives() {
         let mut ar = b"!<arch>\n".to_vec();
-        for &(name, body) in members {
+        for (name, body) in [("debian-binary", &b"2.0\n"[..]), ("odd", &b"abc"[..])] {
             ar.extend(
                 format!(
                     "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
@@ -469,58 +412,6 @@ mod tests {
                 ar.push(b'\n');
             }
         }
-        ar
-    }
-
-    /// A `.deb` with only a control file.
-    fn deb(package: &str, version: &str, arch: &str) -> Vec<u8> {
-        let control = format!("Package: {package}\nVersion: {version}\nArchitecture: {arch}\n");
-        let mut tar = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_size(control.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, "./control", control.as_bytes())
-            .unwrap();
-        let mut xz = liblzma::write::XzEncoder::new(Vec::new(), 6);
-        std::io::Write::write_all(&mut xz, &tar.into_inner().unwrap()).unwrap();
-        ar_archive(&[
-            ("debian-binary", b"2.0\n"),
-            ("control.tar.xz", &xz.finish().unwrap()),
-        ])
-    }
-
-    #[test]
-    fn finds_local_debs() {
-        let dir = tempfile::tempdir().unwrap();
-        let amd64 = dir.path().join("amd64.deb");
-        let arm64 = dir.path().join("arm64.deb");
-        fs::write(&amd64, deb("libc6", "2.41-1", "amd64")).unwrap();
-        fs::write(&arm64, deb("libc6", "2.41-1", "arm64")).unwrap();
-        let files = std::env::join_paths([&amd64, &arm64]).unwrap();
-        let find = |package, version, arch| local_deb(&files, package, version, arch).unwrap();
-
-        assert_eq!(
-            find("libc6", "2.41-1", "arm64"),
-            Some(fs::read(&arm64).unwrap())
-        );
-        assert_eq!(
-            find("libc6", "2.41-1", "amd64"),
-            Some(fs::read(&amd64).unwrap())
-        );
-        assert_eq!(find("libc6", "2.41-2", "amd64"), None);
-        assert_eq!(find("libc7", "2.41-1", "amd64"), None);
-        assert_eq!(find("libc6", "2.41-1", "riscv64"), None);
-
-        let missing = dir.path().join("missing.deb");
-        assert!(local_deb(missing.as_os_str(), "libc6", "2.41-1", "amd64").is_err());
-        fs::write(&missing, b"not a deb").unwrap();
-        assert!(local_deb(missing.as_os_str(), "libc6", "2.41-1", "amd64").is_err());
-    }
-
-    #[test]
-    fn parses_ar_archives() {
-        let ar = ar_archive(&[("debian-binary", b"2.0\n"), ("odd", b"abc")]);
         assert_eq!(ar_member(&ar, "debian-binary").unwrap(), b"2.0\n");
         assert_eq!(ar_member(&ar, "odd").unwrap(), b"abc");
         assert!(ar_member(&ar, "missing").is_err());

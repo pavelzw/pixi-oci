@@ -25,10 +25,6 @@ jobs:
           persist-credentials: false
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
-      # Clippy builds with `--all-features`, so `bundled-glibc`'s build script needs the pinned
-      # libc6 packages.
-      - name: Set up glibc packages
-        uses: ./.github/actions/glibc-debs
       - name: Run linting
         run: pixi run pre-commit-run
         env:
@@ -52,11 +48,8 @@ jobs:
           persist-credentials: false
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
-      # The glibc packages come from the cache; the integration tests still need network access
-      # (conda-forge, Docker Hub). The docker and skopeo tests run only where those tools are
-      # installed.
-      - name: Set up glibc packages
-        uses: ./.github/actions/glibc-debs
+      # The integration tests need network access (conda-forge, Docker Hub, snapshot.debian.org).
+      # The docker and skopeo tests run only where those tools are installed.
       - name: Run tests
         run: pixi run test
         env:
@@ -80,8 +73,6 @@ jobs:
         run: git diff "origin/${BASE_REF}...HEAD" > git.diff
         env:
           BASE_REF: ${{ github.base_ref }}
-      - name: Set up glibc packages
-        uses: ./.github/actions/glibc-debs
       - name: Run cargo-mutants
         run: pixi run mutants --in-diff git.diff
         env:
