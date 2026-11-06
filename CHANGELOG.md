@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.3](https://github.com/pavelzw/pixi-oci/compare/v0.1.2...v0.1.3) - 2026-11-06
+
+### Features
+
+- Build multi-platform images ([#26](https://github.com/pavelzw/pixi-oci/pull/26))
+
+### Testing
+
+- Add linux-riscv64 ([#17](https://github.com/pavelzw/pixi-oci/pull/17))
+
 ## [0.1.2](https://github.com/pavelzw/pixi-oci/compare/v0.1.1...v0.1.2) - 2026-11-01
 
 ### Features
