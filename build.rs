@@ -170,21 +170,30 @@ mod bundled_glibc {
             return path;
         }
         let url = format!("https://snapshot.debian.org/file/{sha1}");
-        let data = ureq::get(&url)
-            .call()
-            .and_then(|mut response| {
+        let get = || {
+            ureq::get(&url).call().and_then(|mut response| {
                 response
                     .body_mut()
                     .with_config()
                     .limit(64 * 1024 * 1024)
                     .read_to_vec()
             })
-            .unwrap_or_else(|e| {
-                panic!(
-                    "could not download libc6 {VERSION} ({arch}) from {url}: {e}\n\
+        };
+        // snapshot.debian.org regularly answers with 503 or 504, so retry with backoff.
+        let mut result = get();
+        for delay in [1, 2, 4, 8, 16] {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(delay));
+            result = get();
+        }
+        let data = result.unwrap_or_else(|e| {
+            panic!(
+                "could not download libc6 {VERSION} ({arch}) from {url}: {e}\n\
                      Set GLIBC_DEBIAN_FILE to a local .deb to skip the download."
-                )
-            });
+            )
+        });
         let actual = hex_sha1(&data);
         assert_eq!(
             actual, sha1,

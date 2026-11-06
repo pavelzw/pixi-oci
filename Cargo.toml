@@ -79,6 +79,7 @@ url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
+reqwest-retry = { version = "0.9", package = "astral-reqwest-retry" }
 
 [dev-dependencies]
 assert_cmd = "2.2"

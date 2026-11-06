@@ -11,6 +11,7 @@ use rattler_networking::{
     authentication_storage::backends::file::FileStorage, proxy::proxies_from_config,
 };
 use reqwest_middleware::ClientWithMiddleware;
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 
 /// The rattler/pixi configuration file type (mirrors, authentication, ...).
 pub type RattlerConfig = rattler_config::config::ConfigBase<rattler_config::config::NoExtension>;
@@ -51,11 +52,17 @@ pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMi
         builder = builder.proxy(proxy);
     }
 
+    // Retry transient failures (connection errors, timeouts, 5xx, 429) with exponential
+    // backoff, e.g. for snapshot.debian.org, which regularly answers with 503 or 504.
+    let retry_policy = ExponentialBackoff::builder()
+        .retry_bounds(Duration::from_secs(1), Duration::from_secs(30))
+        .build_with_max_retries(5);
     let client = reqwest_middleware::ClientBuilder::new(
         builder
             .build()
             .context("could not create download client")?,
     )
+    .with(RetryTransientMiddleware::new_with_policy(retry_policy))
     .with(MirrorMiddleware::from_config(config))
     .with_arc(Arc::new(AuthenticationMiddleware::from_auth_storage(
         auth_storage,
