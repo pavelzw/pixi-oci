@@ -25,6 +25,31 @@ jobs:
           persist-credentials: false
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+      # Clippy builds with `--all-features`, so `bundled-glibc`'s build script needs the pinned
+      # libc6 packages. Cache them so snapshot.debian.org outages don't break the lint.
+      - name: Restore glibc packages
+        id: glibc-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/glibc-debs
+          key: glibc-debs-${{ hashFiles('build.rs', 'src/default_glibc.rs') }}
+      - name: Download glibc packages
+        if: steps.glibc-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DEBS"
+          # The (architecture, SHA-1) pins of build.rs.
+          grep -oE '\("[a-z0-9]+", "[0-9a-f]{40}"\)' build.rs | tr -d '(),"' |
+            while read -r arch sha1; do
+              curl --fail --silent --show-error --location --retry 10 --retry-all-errors \
+                --output "$DEBS/libc6_$arch.deb" "https://snapshot.debian.org/file/$sha1"
+              echo "$sha1  $DEBS/libc6_$arch.deb" | sha1sum --check
+            done
+        env:
+          DEBS: ${{ runner.temp }}/glibc-debs
+      - name: Use cached glibc packages
+        run: echo "GLIBC_DEBIAN_FILE=$(printf '%s:' "$DEBS"/*.deb | sed 's/:$//')" >> "$GITHUB_ENV"
+        env:
+          DEBS: ${{ runner.temp }}/glibc-debs
       - name: Run linting
         run: pixi run pre-commit-run
         env:
