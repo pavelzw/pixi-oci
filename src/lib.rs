@@ -31,7 +31,7 @@ use crate::{
         DockerManifestEntry, Output, blob_path, prune_blobs, write_docker_manifest,
         write_oci_archive,
     },
-    base_image::{TargetPlatform, fetch_base_image},
+    base_image::{TargetPlatform, fetch_base_image, registry_client},
     cleanup::{PartialFile, TempDir},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
@@ -160,6 +160,7 @@ struct BuildContext<'a> {
     reference: &'a str,
     cache_dir: &'a Path,
     client: &'a reqwest_middleware::ClientWithMiddleware,
+    registry_client: &'a oci_client::Client,
     output_oci: &'a OciDir,
     created: chrono::DateTime<chrono::Utc>,
 }
@@ -301,6 +302,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         reference: &reference,
         cache_dir: &cache_dir,
         client: &client,
+        registry_client: &registry_client(),
         output_oci: &output_oci,
         created: created_timestamp(),
     };
@@ -443,7 +445,7 @@ async fn build_platform(
     let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match ctx.base_spec {
         BaseSpec::Image(image) => (
-            fetch_base_image(image, &platform, ctx.output_oci).await?,
+            fetch_base_image(ctx.registry_client, image, &platform, ctx.output_oci).await?,
             Vec::new(),
         ),
         BaseSpec::Scratch(scratch) => (

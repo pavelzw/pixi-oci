@@ -27,6 +27,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Option<RattlerConfig>> {
 
 /// Create a download client like pixi does: mirrors, proxies, TLS verification and the
 /// authentication file are taken from `config`.
+/// The `User-Agent` of every request pixi-oci makes.
+pub const USER_AGENT: &str = concat!("pixi-oci/", env!("CARGO_PKG_VERSION"));
+
 // TODO: use rattler's client construction from a config once it provides one.
 pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMiddleware> {
     let auth_storage = match &config.authentication_override_file {
@@ -45,7 +48,7 @@ pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMi
     let mut builder = reqwest::Client::builder()
         .no_gzip()
         .pool_max_idle_per_host(20)
-        .user_agent(format!("pixi-oci/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(5 * 60))
         .danger_accept_invalid_certs(config.tls_no_verify.unwrap_or(false));
     for proxy in proxies_from_config(&config.proxy_config).context("invalid proxy configuration")? {

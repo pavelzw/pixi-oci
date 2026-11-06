@@ -7,7 +7,7 @@ use futures::StreamExt;
 use oci_client::{
     Client, Reference,
     client::ClientConfig,
-    manifest::{ImageIndexEntry, OciDescriptor},
+    manifest::{ImageIndexEntry, OciDescriptor, OciManifest},
     secrets::RegistryAuth,
 };
 use oci_spec::image::{
@@ -15,7 +15,7 @@ use oci_spec::image::{
 };
 use ocidir::{OciDir, OciRead};
 
-use crate::config::SCRATCH;
+use crate::{config::SCRATCH, install::USER_AGENT};
 
 /// A base image whose layers are available in the output layout.
 #[derive(Debug)]
@@ -82,9 +82,30 @@ fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
         .build()?)
 }
 
+/// A registry client for pulling base images, shared by all platforms of a build so that
+/// connections and tokens are reused. The platform is picked per pull by [`fetch_base_image`].
+pub fn registry_client() -> Client {
+    Client::new(ClientConfig {
+        user_agent: USER_AGENT,
+        platform_resolver: None,
+        ..Default::default()
+    })
+}
+
+/// The digest of the manifest for `platform` in an image index, preferring an exact variant
+/// match.
+fn select_manifest(entries: &[ImageIndexEntry], platform: &TargetPlatform) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| platform.matches(e, true))
+        .or_else(|| entries.iter().find(|e| platform.matches(e, false)))
+        .map(|e| e.digest.clone())
+}
+
 /// Pull the manifest, config and layers of `image` for `platform` into `output`.
 /// Returns `None` for `scratch`.
 pub async fn fetch_base_image(
+    client: &Client,
     image: &str,
     platform: &TargetPlatform,
     output: &OciDir,
@@ -95,18 +116,6 @@ pub async fn fetch_base_image(
     let reference: Reference = image
         .parse()
         .with_context(|| format!("invalid base image reference `{image}`"))?;
-
-    let resolver_platform = platform.clone();
-    let client = Client::new(ClientConfig {
-        platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
-            entries
-                .iter()
-                .find(|e| resolver_platform.matches(e, true))
-                .or_else(|| entries.iter().find(|e| resolver_platform.matches(e, false)))
-                .map(|e| e.digest.clone())
-        })),
-        ..Default::default()
-    });
 
     eprintln!(
         "⬇️  Pulling base image {} ({}/{}{})",
@@ -119,16 +128,32 @@ pub async fn fetch_base_image(
             .map(|v| format!("/{v}"))
             .unwrap_or_default()
     );
-    let (manifest, _digest, config_json) = client
-        .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
+    let context = || {
+        format!(
+            "could not pull base image {} for linux/{}",
+            reference.whole(),
+            platform.arch
+        )
+    };
+    // A multi-platform image is an index of per-platform manifests: pick ours, then pull it by
+    // digest.
+    let (top, digest) = client
+        .pull_manifest(&reference, &RegistryAuth::Anonymous)
         .await
-        .with_context(|| {
-            format!(
-                "could not pull base image {} for linux/{}",
-                reference.whole(),
-                platform.arch
-            )
-        })?;
+        .with_context(context)?;
+    let digest = match top {
+        OciManifest::Image(_) => digest,
+        OciManifest::ImageIndex(index) => select_manifest(&index.manifests, platform)
+            .ok_or_else(|| anyhow!("{} has no image for this platform", reference.whole()))
+            .with_context(context)?,
+    };
+    let (manifest, _digest, config_json) = client
+        .pull_manifest_and_config(
+            &reference.clone_with_digest(digest),
+            &RegistryAuth::Anonymous,
+        )
+        .await
+        .with_context(context)?;
     let config = ImageConfiguration::from_reader(config_json.as_bytes())
         .context("could not parse the base image config")?;
     if config.os() != &Os::Linux || config.architecture() != &platform.arch {
@@ -147,7 +172,7 @@ pub async fn fetch_base_image(
         if output.has_blob(&descriptor)? {
             tracing::debug!("base layer {} already present", layer.digest);
         } else {
-            download_blob(&client, &reference, layer, &descriptor, output).await?;
+            download_blob(client, &reference, layer, &descriptor, output).await?;
         }
         layers.push(descriptor);
     }
@@ -213,6 +238,46 @@ mod tests {
             MediaType::ImageLayerZstd
         );
         assert!(layer_media_type("application/vnd.oci.image.config.v1+json").is_err());
+    }
+
+    #[test]
+    fn selects_manifest_for_platform() {
+        let entry = |digest: &str, arch: &str, variant: Option<&str>| -> ImageIndexEntry {
+            serde_json::from_value(serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": digest,
+                "size": 1,
+                "platform": { "os": "linux", "architecture": arch, "variant": variant },
+            }))
+            .unwrap()
+        };
+        let platform = |arch, variant: Option<&str>| TargetPlatform {
+            arch,
+            variant: variant.map(str::to_string),
+        };
+        let entries = [
+            entry("sha256:amd64", "amd64", None),
+            entry("sha256:arm64", "arm64", None),
+            entry("sha256:arm64v8", "arm64", Some("v8")),
+        ];
+        assert_eq!(
+            select_manifest(&entries, &platform(Arch::Amd64, None)).as_deref(),
+            Some("sha256:amd64")
+        );
+        // An exact variant match wins over an earlier entry without variant.
+        assert_eq!(
+            select_manifest(&entries, &platform(Arch::ARM64, Some("v8"))).as_deref(),
+            Some("sha256:arm64v8")
+        );
+        // Without an exact match, any variant of the architecture will do.
+        assert_eq!(
+            select_manifest(&entries[..2], &platform(Arch::ARM64, Some("v8"))).as_deref(),
+            Some("sha256:arm64")
+        );
+        assert_eq!(
+            select_manifest(&entries, &platform(Arch::s390x, None)),
+            None
+        );
     }
 
     #[test]

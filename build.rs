@@ -170,8 +170,12 @@ mod bundled_glibc {
             return path;
         }
         let url = format!("https://snapshot.debian.org/file/{sha1}");
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .user_agent(concat!("pixi-oci-build/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into();
         let get = || {
-            ureq::get(&url).call().and_then(|mut response| {
+            agent.get(&url).call().and_then(|mut response| {
                 response
                     .body_mut()
                     .with_config()
