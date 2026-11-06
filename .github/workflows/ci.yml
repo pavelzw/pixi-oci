@@ -26,30 +26,9 @@ jobs:
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
       # Clippy builds with `--all-features`, so `bundled-glibc`'s build script needs the pinned
-      # libc6 packages. Cache them so snapshot.debian.org outages don't break the lint.
-      - name: Restore glibc packages
-        id: glibc-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/glibc-debs
-          key: glibc-debs-${{ hashFiles('build.rs', 'src/default_glibc.rs') }}
-      - name: Download glibc packages
-        if: steps.glibc-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$DEBS"
-          # The (architecture, SHA-1) pins of build.rs.
-          grep -oE '\("[a-z0-9]+", "[0-9a-f]{40}"\)' build.rs | tr -d '(),"' |
-            while read -r arch sha1; do
-              curl --fail --silent --show-error --location --retry 10 --retry-all-errors \
-                --output "$DEBS/libc6_$arch.deb" "https://snapshot.debian.org/file/$sha1"
-              echo "$sha1  $DEBS/libc6_$arch.deb" | sha1sum --check
-            done
-        env:
-          DEBS: ${{ runner.temp }}/glibc-debs
-      - name: Use cached glibc packages
-        run: echo "GLIBC_DEBIAN_FILE=$(printf '%s:' "$DEBS"/*.deb | sed 's/:$//')" >> "$GITHUB_ENV"
-        env:
-          DEBS: ${{ runner.temp }}/glibc-debs
+      # libc6 packages.
+      - name: Set up glibc packages
+        uses: ./.github/actions/glibc-debs
       - name: Run linting
         run: pixi run pre-commit-run
         env:
@@ -73,8 +52,11 @@ jobs:
           persist-credentials: false
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
-      # The integration tests need network access (conda-forge, Docker Hub, snapshot.debian.org).
-      # The docker and skopeo tests run only where those tools are installed.
+      # The glibc packages come from the cache; the integration tests still need network access
+      # (conda-forge, Docker Hub). The docker and skopeo tests run only where those tools are
+      # installed.
+      - name: Set up glibc packages
+        uses: ./.github/actions/glibc-debs
       - name: Run tests
         run: pixi run test
         env:
@@ -98,6 +80,8 @@ jobs:
         run: git diff "origin/${BASE_REF}...HEAD" > git.diff
         env:
           BASE_REF: ${{ github.base_ref }}
+      - name: Set up glibc packages
+        uses: ./.github/actions/glibc-debs
       - name: Run cargo-mutants
         run: pixi run mutants --in-diff git.diff
         env:

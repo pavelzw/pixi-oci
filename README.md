@@ -104,6 +104,8 @@ base = { shadow-setup = false, glibc = false }
 
 Builds of `pixi-oci` with the `bundled-glibc` cargo feature embed the default `libc6` packages for `amd64` and `arm64`, so they are not downloaded at runtime. Other versions and architectures are still downloaded.
 
+To use local copies instead of downloading, e.g. offline or when snapshot.debian.org is down, set `GLIBC_DEBIAN_FILE` to the `.deb` files, separated by `:`. A file is used when its `Package`, `Version` and `Architecture` match; anything else is still downloaded.
+
 ### Environment activation
 
 The image config carries everything `pixi shell-hook` would export: `PATH` with `<install-prefix>/bin` in front, `CONDA_PREFIX`, variables from the packages' `etc/conda/env_vars.d` and `oci-config.env`. Containers therefore start with an activated environment, even for `scratch` images without a shell.
