@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_verbosity_flag::{Verbosity, WarnLevel};
-use pixi_oci::{BuildOptions, OutputFormat};
+use pixi_oci::{BuildOptions, InjectSpec, OutputFormat};
 use rattler_conda_types::PackageName;
 
 /// Build OCI images from pixi environments, without a container daemon.
@@ -38,9 +38,10 @@ struct BuildArgs {
     #[arg(short, long)]
     environment: Option<String>,
 
-    /// The conda platform to build for, e.g. `linux-64` (default: see README).
-    #[arg(short, long)]
-    platform: Option<String>,
+    /// The conda platform to build for, e.g. `linux-64` (default: see README). Give it
+    /// multiple times or comma-separated to build a multi-platform image.
+    #[arg(short, long, value_delimiter = ',')]
+    platform: Vec<String>,
 
     /// Output path. `-` writes the tarball to stdout. Defaults to `<name>.tar` or `<name>/`.
     #[arg(short, long)]
@@ -59,9 +60,10 @@ struct BuildArgs {
     config: Option<PathBuf>,
 
     /// Inject an additional local conda package (`.conda` or `.tar.bz2`) into the environment.
-    /// Replaces a locked package of the same name. Can be given multiple times.
-    #[arg(short, long)]
-    inject: Vec<PathBuf>,
+    /// Replaces a locked package of the same name. Prefix with `PLATFORM:` to inject it only
+    /// for that platform. Can be given multiple times.
+    #[arg(short, long, value_name = "[PLATFORM:]PATH")]
+    inject: Vec<InjectSpec>,
 
     /// Leave a locked conda package out of the environment. Combine with `--inject` to replace
     /// a source package with a package built by `pixi build`. Can be given multiple times.
@@ -114,7 +116,7 @@ async fn main() -> Result<()> {
             let report = pixi_oci::build(BuildOptions {
                 manifest_path: args.manifest_path,
                 environment: args.environment,
-                platform: args.platform,
+                platforms: args.platform,
                 output: args.output,
                 format: args.format.into(),
                 tag: args.tag,
@@ -124,18 +126,24 @@ async fn main() -> Result<()> {
                 skip_validation: args.skip_validation,
             })
             .await?;
-            tracing::info!(
-                "manifest {} config {} ({} base + {} package layers{})",
-                report.manifest_digest,
-                report.config_digest,
-                report.base_layers,
-                report.package_layers,
-                if report.copy_layer {
-                    " + copy layer"
-                } else {
-                    ""
-                }
-            );
+            if let Some(index) = &report.index_digest {
+                tracing::info!("index {index}");
+            }
+            for image in &report.images {
+                tracing::info!(
+                    "{}: manifest {} config {} ({} base + {} package layers{})",
+                    image.subdir.as_str(),
+                    image.manifest_digest,
+                    image.config_digest,
+                    image.base_layers,
+                    image.package_layers,
+                    if image.copy_layer {
+                        " + copy layer"
+                    } else {
+                        ""
+                    }
+                );
+            }
         }
         Command::Completion { shell } => {
             let mut cmd = Cli::command();

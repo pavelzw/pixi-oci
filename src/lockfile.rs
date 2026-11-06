@@ -10,24 +10,29 @@ use rattler_lock::{CondaPackageData, LockFile, LockedPackage};
 #[derive(Debug)]
 pub struct LockedEnvironment {
     pub environment: String,
+    /// The platform name in the lockfile, usually the same as `subdir`.
+    pub platform: String,
     pub subdir: Subdir,
     pub records: Vec<RepoDataRecord>,
 }
 
-/// Load the lockfile and resolve the requested environment and platform.
+/// Load the lockfile and resolve the requested environment and platforms, one
+/// [`LockedEnvironment`] per platform in the requested order.
 ///
-/// Platform resolution order: the explicit request (a lockfile platform name or a conda
-/// subdir), then the current platform if it is linux, then the single linux platform of the
-/// environment. Non-linux platforms are rejected.
+/// Each requested platform is a lockfile platform name or a conda subdir. Without a request,
+/// the current platform is used if it is linux, else the single linux platform of the
+/// environment. Non-linux platforms are rejected, and so are two platforms with the same
+/// subdir, as they would be the same OCI platform.
 ///
 /// Conda packages named in `skip` are left out, including source packages, which can't be
-/// installed otherwise. Every name in `skip` must match a locked conda package.
-pub fn load_locked_environment(
+/// installed otherwise. Every name in `skip` must match a locked conda package on every
+/// platform.
+pub fn load_locked_environments(
     lockfile_path: &Path,
     environment: &str,
-    requested_platform: Option<&str>,
+    requested_platforms: &[String],
     skip: &[PackageName],
-) -> Result<LockedEnvironment> {
+) -> Result<Vec<LockedEnvironment>> {
     let lockfile = LockFile::from_path(lockfile_path)
         .with_context(|| format!("could not read lockfile {}", lockfile_path.display()))?;
 
@@ -41,10 +46,41 @@ pub fn load_locked_environment(
         )
     })?;
 
-    let platform = match requested_platform {
-        Some(requested) => find_platform(&env, requested)?,
-        None => default_platform(&env)?,
+    let platforms = if requested_platforms.is_empty() {
+        vec![default_platform(&env)?]
+    } else {
+        requested_platforms
+            .iter()
+            .map(|requested| find_platform(&env, requested))
+            .collect::<Result<Vec<_>>>()?
     };
+    for (i, platform) in platforms.iter().enumerate() {
+        if let Some(other) = platforms[..i]
+            .iter()
+            .find(|p| p.subdir() == platform.subdir())
+        {
+            bail!(
+                "platforms `{}` and `{}` both have the conda platform {}; an image index can \
+                 only hold one image per platform",
+                other.name().as_str(),
+                platform.name().as_str(),
+                platform.subdir().as_str()
+            );
+        }
+    }
+
+    platforms
+        .into_iter()
+        .map(|platform| locked_environment(&env, environment, platform, skip))
+        .collect()
+}
+
+fn locked_environment(
+    env: &rattler_lock::Environment<'_>,
+    environment: &str,
+    platform: rattler_lock::Platform<'_>,
+    skip: &[PackageName],
+) -> Result<LockedEnvironment> {
     let subdir = platform.subdir();
     if !subdir.is_linux() {
         bail!(
@@ -108,6 +144,7 @@ pub fn load_locked_environment(
 
     Ok(LockedEnvironment {
         environment: environment.to_string(),
+        platform: platform.name().as_str().to_string(),
         subdir,
         records,
     })
@@ -218,12 +255,19 @@ packages:
   - caddy
 "#;
 
-    fn load(skip: &[&str]) -> Result<LockedEnvironment> {
+    fn load_platforms(platforms: &[&str], skip: &[&str]) -> Result<Vec<LockedEnvironment>> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pixi.lock");
         std::fs::write(&path, LOCKFILE).unwrap();
+        let platforms: Vec<_> = platforms.iter().map(|p| p.to_string()).collect();
         let skip: Vec<_> = skip.iter().map(|s| s.parse().unwrap()).collect();
-        load_locked_environment(&path, "default", None, &skip)
+        load_locked_environments(&path, "default", &platforms, &skip)
+    }
+
+    fn load(skip: &[&str]) -> Result<LockedEnvironment> {
+        let mut envs = load_platforms(&[], skip)?;
+        assert_eq!(envs.len(), 1);
+        Ok(envs.remove(0))
     }
 
     fn names(env: &LockedEnvironment) -> Vec<&str> {
@@ -255,5 +299,25 @@ packages:
     fn rejects_unknown_skipped_packages() {
         let err = load(&["myapp", "nope"]).unwrap_err();
         assert!(err.to_string().contains("cannot skip nope"), "{err}");
+    }
+
+    #[test]
+    fn resolves_requested_platforms() {
+        let envs = load_platforms(&["linux-64"], &["myapp"]).unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].platform, "linux-64");
+        assert_eq!(envs[0].subdir, Subdir::Linux64);
+    }
+
+    #[test]
+    fn rejects_duplicate_platforms() {
+        let err = load_platforms(&["linux-64", "linux-64"], &["myapp"]).unwrap_err();
+        assert!(err.to_string().contains("one image per platform"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_platforms() {
+        let err = load_platforms(&["linux-64", "linux-aarch64"], &["myapp"]).unwrap_err();
+        assert!(err.to_string().contains("not found in lockfile"), "{err}");
     }
 }

@@ -1,6 +1,9 @@
 //! Injecting local conda packages that are not part of `pixi.lock`, like `pixi-pack --inject`.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rattler_conda_types::{
@@ -9,6 +12,53 @@ use rattler_conda_types::{
 use rattler_digest::{Md5, Sha256, compute_file_digest};
 use rattler_package_streaming::seek::read_package_file;
 use url::Url;
+
+/// A package to inject: `PATH` for every platform, or `PLATFORM:PATH` for one platform only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectSpec {
+    /// A lockfile platform name or conda subdir; `None` means every platform.
+    pub platform: Option<String>,
+    pub path: PathBuf,
+}
+
+impl InjectSpec {
+    /// Whether the package goes into the image for `platform` (a lockfile platform name)
+    /// with conda platform `subdir`.
+    pub fn applies_to(&self, platform: &str, subdir: Subdir) -> bool {
+        self.platform
+            .as_deref()
+            .is_none_or(|p| p == platform || p == subdir.as_str())
+    }
+}
+
+impl From<PathBuf> for InjectSpec {
+    fn from(path: PathBuf) -> Self {
+        Self {
+            platform: None,
+            path,
+        }
+    }
+}
+
+impl FromStr for InjectSpec {
+    type Err = std::convert::Infallible;
+
+    /// The part before the first `:` is a platform unless it contains a `/` or the whole
+    /// string is an existing file, so paths containing a `:` keep working.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((platform, path)) = s.split_once(':')
+            && !platform.is_empty()
+            && !platform.contains('/')
+            && !Path::new(s).exists()
+        {
+            return Ok(Self {
+                platform: Some(platform.to_string()),
+                path: PathBuf::from(path),
+            });
+        }
+        Ok(PathBuf::from(s).into())
+    }
+}
 
 /// Build a record for a local `.conda` or `.tar.bz2` file from the `index.json` inside it.
 pub fn injected_record(path: &Path) -> Result<RepoDataRecord> {
@@ -162,6 +212,23 @@ mod tests {
                 .unwrap(),
             channel: None,
         }
+    }
+
+    #[test]
+    fn parses_inject_specs() {
+        let spec = |s: &str| s.parse::<InjectSpec>().unwrap();
+        assert_eq!(
+            spec("dist/foo.conda"),
+            PathBuf::from("dist/foo.conda").into()
+        );
+        let scoped = spec("linux-64:dist/foo.conda");
+        assert_eq!(scoped.platform.as_deref(), Some("linux-64"));
+        assert_eq!(scoped.path, PathBuf::from("dist/foo.conda"));
+        assert!(scoped.applies_to("linux-64", Subdir::Linux64));
+        assert!(!scoped.applies_to("linux-aarch64", Subdir::LinuxAarch64));
+        assert!(spec("foo.conda").applies_to("linux-aarch64", Subdir::LinuxAarch64));
+        // A colon in a directory name is not a platform.
+        assert_eq!(spec("./a:b/foo.conda").platform, None);
     }
 
     #[test]

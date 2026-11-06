@@ -44,8 +44,8 @@ pub struct PixiOciConfig {
     pub base: Option<BaseSpec>,
     /// The pixi environment to install.
     pub environment: Option<String>,
-    /// The conda platform (subdir) to build for.
-    pub platform: Option<String>,
+    /// The conda platform(s) (subdir or lockfile platform name) to build for.
+    pub platform: Option<Platforms>,
     /// Absolute path of the environment inside the image.
     pub install_prefix: Option<String>,
     /// Image reference as `name:tag` or `name` (tag `latest`).
@@ -60,6 +60,23 @@ pub struct PixiOciConfig {
     /// Image config fields (docker image spec `config`).
     #[serde(default)]
     pub oci_config: OciConfigSection,
+}
+
+/// `platform`: a single platform or a list of platforms for a multi-platform image.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Platforms {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Platforms {
+    pub fn to_vec(&self) -> Vec<String> {
+        match self {
+            Platforms::One(platform) => vec![platform.clone()],
+            Platforms::Many(platforms) => platforms.clone(),
+        }
+    }
 }
 
 /// `base`: either a registry reference such as `"ubuntu:latest"` (or `"scratch"` for an empty
@@ -461,6 +478,20 @@ exposed-ports = [8080]
         );
         assert!(config.labels().is_none());
         assert!(config.volumes().is_none());
+    }
+
+    #[test]
+    fn parses_one_or_many_platforms() {
+        let platforms = |toml: &str| parse(toml).tool.pixi_oci.platform.map(|p| p.to_vec());
+        assert_eq!(
+            platforms("[tool.pixi-oci]\nplatform = \"linux-64\"\n"),
+            Some(vec!["linux-64".to_string()])
+        );
+        assert_eq!(
+            platforms("[tool.pixi-oci]\nplatform = [\"linux-64\", \"linux-aarch64\"]\n"),
+            Some(vec!["linux-64".to_string(), "linux-aarch64".to_string()])
+        );
+        assert_eq!(platforms("[tool.pixi-oci]\n"), None);
     }
 
     #[test]

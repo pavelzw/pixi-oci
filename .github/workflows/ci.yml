@@ -58,7 +58,7 @@ jobs:
   mutants:
     name: Mutation testing
     if: github.event_name == 'pull_request'
-    timeout-minutes: 60
+    timeout-minutes: 120
     runs-on: ubuntu-latest
     steps:
       - name: Checkout branch

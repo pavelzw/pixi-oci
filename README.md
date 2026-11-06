@@ -16,6 +16,7 @@ It replaces the usual multi-stage Dockerfile dance (`pixi install` → `pixi she
 pixi-oci build
 pixi-oci build --manifest-path app
 pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
+pixi-oci build -p linux-64 -p linux-aarch64
 pixi-oci build --format oci-dir -o ./myapp
 pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
@@ -72,7 +73,7 @@ stop-signal = "SIGTERM"
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `base`             | A registry image to build on, or a minimal root filesystem built from scratch. See [Base](#base).                                                                              |
 | `environment`      | The pixi environment to put into the image.                                                                                                                                    |
-| `platform`         | Conda platform to build for. Only linux platforms are supported.                                                                                                               |
+| `platform`         | Conda platform to build for, or a list of platforms for a multi-platform image. Only linux platforms are supported.                                                            |
 | `install-prefix`   | Absolute path of the environment inside the image.                                                                                                                             |
 | `tag`              | Image reference as `name:tag`, or `name` for `name:latest`. Required unless `--tag` is given, which replaces it.                                                               |
 | `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                               |
@@ -121,6 +122,32 @@ pixi-oci build --inject myapp-1.0.0-pyh4616a5c_0.conda --inject mylib-0.3.0-h123
 
 Injected packages must be built for the target platform or `noarch`. A locked package with the same name is replaced. Before installing, `pixi-oci` checks that the dependencies and constraints of all packages, injected or locked, are satisfied by the environment. Pass `--skip-validation` to build anyway.
 
+With several platforms, `--inject foo.conda` goes into the image of every platform, while `--inject linux-64:foo.conda` only goes into the `linux-64` image:
+
+```shell
+pixi-oci build -p linux-64,linux-aarch64 \
+  --inject dist/mylib-0.3.0-pyh4616a5c_0.conda \
+  --inject linux-64:dist/myapp-1.0.0-h1234567_0.conda \
+  --inject linux-aarch64:dist/myapp-1.0.0-h7654321_0.conda
+```
+
+### Multi-platform images
+
+Give `--platform` several times (or comma-separated), or set `platform` to a list, to build one image per platform and combine them into a multi-platform image:
+
+```toml
+[tool.pixi-oci]
+platform = ["linux-64", "linux-aarch64"]
+```
+
+The platforms are built one after another. Packages are installed without running link scripts, so any platform can be built on any host, without emulation. The images share a single tag: `index.json` references an image index listing one manifest per platform, the same layout BuildKit's OCI exporter writes.
+
+The docker-archive format has no notion of platforms, so a multi-platform tarball has no `manifest.json`. `docker load` needs the [containerd image store](https://docs.docker.com/engine/storage/containerd/) for it, while podman, skopeo and crane read it directly:
+
+```shell
+skopeo copy --multi-arch all oci-archive:myapp.tar docker://ghcr.io/you/myapp:1.2.3
+```
+
 ### Skip locked packages
 
 `--skip <name>` leaves a locked conda package out of the environment. Combined with `--inject`, this puts a pixi-build source package into the image, which `pixi-oci` can't build itself:
@@ -135,7 +162,6 @@ pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 - PyPI dependencies in the lockfile are rejected. Use conda packages for now.
 - Only `[tool.pixi-oci]` is read from the manifest. `[activation]` tables are ignored, and `pixi.lock` is not checked against the manifest, so run `pixi lock` after changing dependencies.
 - Source packages (pixi-build) are not built; build them with `pixi build` and use `--skip` with `--inject`.
-- One platform per build; there is no multi-arch index yet.
 - `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.
 
 ## Development
