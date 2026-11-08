@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.4](https://github.com/pavelzw/pixi-oci/compare/v0.1.3...v0.1.4) - 2026-11-08
+
+### Features
+
+- Show human-readable archive size ([#28](https://github.com/pavelzw/pixi-oci/pull/28))
+
 ## [0.1.3](https://github.com/pavelzw/pixi-oci/compare/v0.1.2...v0.1.3) - 2026-11-06
 
 ### Features
