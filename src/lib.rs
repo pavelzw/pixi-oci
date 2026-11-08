@@ -386,16 +386,16 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
                     Some(PartialFile::new(output_path.clone())),
                 )
             };
-            let bytes = write_oci_archive(&layout_dir, &destination)?;
+            let bytes = indicatif::HumanBytes(write_oci_archive(&layout_dir, &destination)?);
             if let Some(partial) = partial {
                 partial.keep();
             }
             if to_stdout {
-                eprintln!("✅ Wrote {reference} for {subdirs} ({bytes} bytes) to stdout");
+                eprintln!("✅ Wrote {reference} for {subdirs} ({bytes}) to stdout");
                 None
             } else {
                 eprintln!(
-                    "✅ Wrote {reference} for {subdirs} ({bytes} bytes) to {}",
+                    "✅ Wrote {reference} for {subdirs} ({bytes}) to {}",
                     output_path.display()
                 );
                 Some(output_path)
