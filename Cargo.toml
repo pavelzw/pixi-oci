@@ -43,21 +43,21 @@ indicatif = "0.18"
 liblzma = { version = "0.4", default-features = false, features = ["static"] }
 oci-client = { version = "0.18", default-features = false }
 oci-spec = "0.10"
-ocidir = "0.8"
-rattler = { version = "0.54.1", default-features = false, features = [
+ocidir = "0.9"
+rattler = { version = "0.55.9", default-features = false, features = [
   "indicatif",
 ] }
-rattler_cache = { version = "0.10.19", default-features = false }
-rattler_conda_types = "0.57.0"
-rattler_config = "0.9.3"
-rattler_lock = "0.34.7"
+rattler_cache = { version = "0.12.4", default-features = false }
+rattler_conda_types = "0.58.4"
+rattler_config = "0.12.3"
+rattler_lock = "0.34.15"
 rattler_digest = { version = "2.1.0", default-features = false }
-rattler_networking = { version = "0.34.1", default-features = false, features = [
+rattler_networking = { version = "0.34.9", default-features = false, features = [
   "dirs",
   "rattler_config",
 ] }
-rattler_package_streaming = { version = "0.27.14", default-features = false }
-rattler_shell = "0.29.4"
+rattler_package_streaming = { version = "0.28.6", default-features = false }
+rattler_shell = "0.29.11"
 reqwest = { version = "0.13", default-features = false, features = ["http2"] }
 reqwest-middleware = { package = "astral-reqwest-middleware", version = "0.5" }
 serde = { version = "1.0", features = ["derive"] }
@@ -74,7 +74,7 @@ tokio = { version = "1", features = [
   "io-util",
   "signal",
 ] }
-toml = "1.1"
+toml = "1.2"
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -85,7 +85,7 @@ docker_credential = "1.4.0"
 
 [dev-dependencies]
 assert_cmd = "2.2"
-rstest = "0.28"
+rstest = "0.29"
 
 [profile.release]
 codegen-units = 1
