@@ -19,7 +19,7 @@ pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
 pixi-oci build -p linux-64 -p linux-aarch64
 pixi-oci build --format oci-dir -o ./myapp
 pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
-pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
+pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.condapixi-oci build server worker   # only these of [tool.pixi-oci.images]
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -79,6 +79,7 @@ stop-signal = "SIGTERM"
 | `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                               |
 | `copy-to-image`    | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile.          |
 | `activation-shell` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts).                                                                              |
+| `images.<name>`    | Named images, each a table with the keys above. See [Multiple images](#multiple-images).                                                                                       |
 | `oci-config.*`     | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`). |
 
 ### Base
@@ -172,3 +173,35 @@ pixi run test
 pixi run pre-commit-run
 pixi run example
 ```
+
+### Multiple images
+
+To build several images from one manifest, for example from different environments, describe each in `[tool.pixi-oci.images.<name>]`. The top-level `[tool.pixi-oci]` table then holds the defaults shared by all images instead of being an image of its own:
+
+```toml
+[tool.pixi-oci]
+base = { glibc = true }
+platform = ["linux-64", "linux-aarch64"]
+oci-config.labels = { "org.opencontainers.image.source" = "https://github.com/you/example" }
+
+[tool.pixi-oci.images.server]
+environment = "prod"
+tag = "ghcr.io/you/server"
+oci-config.entrypoint = "server --port 8080"
+
+[tool.pixi-oci.images.worker]
+environment = "worker"
+platform = "linux-64"
+oci-config.entrypoint = "worker"
+```
+
+```shell
+pixi-oci build                 # all images: ghcr.io_you_server.tar and worker.tar
+pixi-oci build worker          # only worker
+pixi-oci build server -o server.tar
+```
+
+- An image takes every key it doesn't set from the top-level table. `oci-config.labels` and `oci-config.env` are merged key by key, and an image that sets `oci-config.entrypoint` doesn't inherit `oci-config.cmd`, like in a Dockerfile.
+- An image without a `tag` is tagged with its name, so `worker` above becomes `worker:latest`.
+- Each image is written to its own `<name>.tar` (or `<name>/` with `--format oci-dir`), named after its tag. `--tag`, `--output` and `--environment` need a single selected image; `--platform`, `--inject` and `--skip` apply to every image.
+- All images are checked against the lockfile before anything is downloaded.
