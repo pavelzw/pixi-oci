@@ -132,33 +132,48 @@ fn server_key(reference: &Reference) -> String {
 /// a broken config or credential helper shouldn't fail builds that don't need credentials.
 fn credential_from_file(path: &Path, server: &str) -> Option<RegistryAuth> {
     let file = File::open(path).ok()?;
-    match docker_credential::get_credential_from_reader(BufReader::new(file), server) {
-        Ok(DockerCredential::UsernamePassword(username, password)) => {
-            Some(RegistryAuth::Basic(username, password))
-        }
-        Ok(DockerCredential::IdentityToken(_)) => {
+    let result = docker_credential::get_credential_from_reader(BufReader::new(file), server);
+    match classify(result) {
+        Lookup::Found(auth) => Some(auth),
+        Lookup::Missing => None,
+        Lookup::Skipped(reason) => {
             tracing::warn!(
-                "ignoring the identity token for {server} in {}: identity tokens are not \
-                 supported, use a username and password (or {USERNAME_ENV} and {PASSWORD_ENV})",
+                "ignoring credentials for {server} in {}: {reason}",
                 path.display()
             );
             None
         }
-        Err(CredentialRetrievalError::NoCredentialConfigured) => None,
+    }
+}
+
+/// The outcome of looking up a registry in one auth file.
+#[derive(Debug, PartialEq)]
+enum Lookup {
+    Found(RegistryAuth),
+    /// The file has no entry for the registry.
+    Missing,
+    /// The file has an entry that can't be used, and why.
+    Skipped(String),
+}
+
+fn classify(result: Result<DockerCredential, CredentialRetrievalError>) -> Lookup {
+    match result {
+        Ok(DockerCredential::UsernamePassword(username, password)) => {
+            Lookup::Found(RegistryAuth::Basic(username, password))
+        }
+        Ok(DockerCredential::IdentityToken(_)) => Lookup::Skipped(format!(
+            "identity tokens are not supported, use a username and password \
+             (or {USERNAME_ENV} and {PASSWORD_ENV})"
+        )),
+        Err(CredentialRetrievalError::NoCredentialConfigured) => Lookup::Missing,
         // A credential store without an entry for this registry: the common case for public
         // images on machines with Docker Desktop.
         Err(CredentialRetrievalError::HelperFailure { stdout, .. })
             if stdout.contains("credentials not found") =>
         {
-            None
+            Lookup::Missing
         }
-        Err(e) => {
-            tracing::warn!(
-                "could not read credentials for {server} from {}: {e}",
-                path.display()
-            );
-            None
-        }
+        Err(e) => Lookup::Skipped(e.to_string()),
     }
 }
 
@@ -254,6 +269,53 @@ mod tests {
         };
         let resolved = sources.resolve(&reference("x.azurecr.io/a")).unwrap();
         assert_eq!(resolved.source, AuthSource::Anonymous);
+    }
+
+    #[test]
+    fn classifies_lookup_results() {
+        let helper_failure = |stdout: &str| CredentialRetrievalError::HelperFailure {
+            helper: "desktop".into(),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
+        assert_eq!(
+            classify(Ok(DockerCredential::UsernamePassword(
+                "u".into(),
+                "p".into()
+            ))),
+            Lookup::Found(RegistryAuth::Basic("u".into(), "p".into()))
+        );
+        assert_eq!(
+            classify(Err(CredentialRetrievalError::NoCredentialConfigured)),
+            Lookup::Missing
+        );
+        assert_eq!(
+            classify(Err(helper_failure(
+                "credentials not found in native keychain"
+            ))),
+            Lookup::Missing
+        );
+        assert!(matches!(
+            classify(Err(helper_failure("error getting credentials"))),
+            Lookup::Skipped(reason) if reason.contains("desktop")
+        ));
+        assert!(matches!(
+            classify(Ok(DockerCredential::IdentityToken("t".into()))),
+            Lookup::Skipped(reason) if reason.contains("identity tokens")
+        ));
+    }
+
+    #[test]
+    fn describes_sources() {
+        assert_eq!(AuthSource::Anonymous.to_string(), "anonymous access");
+        assert_eq!(
+            AuthSource::Environment.to_string(),
+            format!("credentials from ${USERNAME_ENV}")
+        );
+        assert_eq!(
+            AuthSource::File(PathBuf::from("/a/config.json")).to_string(),
+            "credentials from /a/config.json"
+        );
     }
 
     #[test]
