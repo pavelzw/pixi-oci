@@ -62,7 +62,7 @@ struct BuildArgs {
     #[arg(short, long)]
     tag: Option<String>,
 
-    /// A pixi/rattler config file with mirrors or authentication settings.
+    /// A pixi/rattler config file with mirrors, authentication, proxy or TLS settings.
     #[arg(short, long)]
     config: Option<PathBuf>,
 

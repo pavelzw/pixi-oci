@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use oci_client::{
     Client, Reference,
-    client::{ClientConfig, ClientProtocol},
+    client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol},
     manifest::{ImageIndexEntry, OciDescriptor},
 };
 use oci_spec::image::{
@@ -16,6 +16,7 @@ use ocidir::{OciDir, OciRead};
 
 use crate::{
     config::SCRATCH,
+    install::{RattlerConfig, tls_root_certs_only},
     registry_auth::{AuthSource, CredentialSources, ResolvedAuth},
 };
 
@@ -124,15 +125,37 @@ fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
         .build()?)
 }
 
+/// The registry client configuration: TLS verification, root certificates and proxies are taken
+/// from `config`, like for the package download client.
+fn oci_client_config(config: &RattlerConfig) -> ClientConfig {
+    let proxy = &config.proxy_config;
+    ClientConfig {
+        accept_invalid_certificates: config.tls_no_verify.unwrap_or(false),
+        tls_certs_only: tls_root_certs_only(config)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|der| Certificate {
+                encoding: CertificateEncoding::Der,
+                data: der.to_vec(),
+            })
+            .collect(),
+        https_proxy: proxy.https.as_ref().map(ToString::to_string),
+        http_proxy: proxy.http.as_ref().map(ToString::to_string),
+        no_proxy: (!proxy.non_proxy_hosts.is_empty()).then(|| proxy.non_proxy_hosts.join(",")),
+        ..Default::default()
+    }
+}
+
 /// Pull the manifest, config and layers of `source` for `platform` into `output`.
 pub async fn fetch_base_image(
     source: &BaseImageSource,
     platform: &TargetPlatform,
     output: &OciDir,
+    config: &RattlerConfig,
 ) -> Result<BaseImage> {
     let reference = &source.reference;
     let resolver_platform = platform.clone();
-    let client = Client::new(ClientConfig {
+    let client = Client::try_from(ClientConfig {
         protocol: protocol_for(reference.resolve_registry()),
         platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
             entries
@@ -141,8 +164,9 @@ pub async fn fetch_base_image(
                 .or_else(|| entries.iter().find(|e| resolver_platform.matches(e, false)))
                 .map(|e| e.digest.clone())
         })),
-        ..Default::default()
-    });
+        ..oci_client_config(config)
+    })
+    .context("could not create the registry client")?;
 
     eprintln!(
         "⬇️  Pulling base image {} ({}/{}{})",
@@ -284,5 +308,51 @@ mod tests {
         assert_eq!(r.whole(), "docker.io/library/ubuntu:latest");
         let r: Reference = "ghcr.io/prefix-dev/pixi:0.40.0".parse().unwrap();
         assert_eq!(r.whole(), "ghcr.io/prefix-dev/pixi:0.40.0");
+    }
+
+    #[test]
+    fn registry_client_uses_system_roots_by_default() {
+        let config = oci_client_config(&RattlerConfig::default());
+        assert!(!config.accept_invalid_certificates);
+        assert!(config.tls_certs_only.is_empty());
+        assert_eq!(config.https_proxy, None);
+        assert_eq!(config.http_proxy, None);
+        assert_eq!(config.no_proxy, None);
+    }
+
+    #[test]
+    fn registry_client_follows_rattler_config() {
+        let config: RattlerConfig = toml::from_str(
+            r#"
+            tls-no-verify = true
+            tls-root-certs = "webpki"
+
+            [proxy-config]
+            https = "http://proxy.example.com:8080"
+            http = "http://proxy.example.com:8081"
+            non-proxy-hosts = ["localhost", "registry.internal"]
+            "#,
+        )
+        .unwrap();
+        let config = oci_client_config(&config);
+        assert!(config.accept_invalid_certificates);
+        assert_eq!(
+            config.tls_certs_only.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len()
+        );
+        assert_eq!(
+            config.https_proxy.as_deref(),
+            Some("http://proxy.example.com:8080/")
+        );
+        assert_eq!(
+            config.http_proxy.as_deref(),
+            Some("http://proxy.example.com:8081/")
+        );
+        assert_eq!(
+            config.no_proxy.as_deref(),
+            Some("localhost,registry.internal")
+        );
+        // The registry client builds with the webpki roots.
+        Client::try_from(config).unwrap();
     }
 }
