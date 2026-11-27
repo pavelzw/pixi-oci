@@ -1,4 +1,4 @@
-# A workspace with a pixi-build source package, built by `pixi-oci build` with `pixi build`.
+# A workspace with a pixi-build source package, built by `pixi-oci build` with `pixi publish`.
 [workspace]
 channels = ["conda-forge"]
 name = "source-build"

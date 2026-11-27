@@ -829,11 +829,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         .expect("pixi-oci runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert_eq!(
-        stderr.matches("Building source package greeter").count(),
-        1,
-        "{stderr}"
-    );
+    assert_eq!(stderr.matches("Building greeter").count(), 1, "{stderr}");
     let metas: Vec<_> = ["one.tar", "two.tar"]
         .iter()
         .map(|file| {
@@ -863,7 +859,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
     .await
     .unwrap_err();
     assert!(
-        format!("{err:#}").contains("could not build source package greeter"),
+        format!("{err:#}").contains("could not build source packages greeter"),
         "{err:#}"
     );
 }

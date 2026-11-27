@@ -1,4 +1,5 @@
-//! Building the source packages of the lockfile (pixi-build) with `pixi build`, like pixi-pack.
+//! Building the source packages of the lockfile (pixi-build) with `pixi publish`, like
+//! pixi-pack.
 
 use std::{
     ffi::OsString,
@@ -23,11 +24,12 @@ fn pixi_executable() -> OsString {
 pub struct SourceBuilder {
     /// The directory of the lockfile, which relative source locations are relative to.
     workspace_dir: PathBuf,
-    /// Where `pixi build` puts the packages; they have to stay until they are installed.
+    /// Where `pixi publish` puts the packages; they have to stay until they are installed.
     output_dir: PathBuf,
-    /// Every build so far: its location, the platform it was built for and its packages.
-    /// Packages that are all noarch serve every platform.
-    builds: Vec<(UrlOrPath, Subdir, Vec<RepoDataRecord>)>,
+    builds: usize,
+    /// Every package built so far, with the platform it was built for. A noarch package
+    /// serves every platform.
+    built: Vec<(Subdir, RepoDataRecord)>,
 }
 
 impl SourceBuilder {
@@ -35,76 +37,93 @@ impl SourceBuilder {
         Self {
             workspace_dir: workspace_dir.to_path_buf(),
             output_dir: output_dir.to_path_buf(),
-            builds: Vec::new(),
+            builds: 0,
+            built: Vec::new(),
         }
+    }
+
+    /// A package built earlier that serves `subdir`.
+    fn earlier(&self, source: &SourcePackage, subdir: Subdir) -> Option<&RepoDataRecord> {
+        self.built
+            .iter()
+            .find(|(s, r)| {
+                r.package_record.name == source.name
+                    && (*s == subdir || r.package_record.subdir == Subdir::NoArch.as_str())
+            })
+            .map(|(_, r)| r)
     }
 
     /// Build the `sources` for `subdir` and return a record for each of them.
     ///
-    /// Every location is built once per platform, even if it provides several of the
-    /// packages or several images need it. Noarch packages are only built once.
+    /// All of them are built together in one `pixi publish`, so source packages may depend on
+    /// each other at runtime. Nothing is built when earlier builds already provide every
+    /// package, e.g. for another image, and a noarch package built for an earlier platform is
+    /// reused, so all platforms install the same file.
     pub fn build(
         &mut self,
         sources: &[SourcePackage],
         subdir: Subdir,
     ) -> Result<Vec<RepoDataRecord>> {
-        let mut locations: Vec<(&UrlOrPath, Vec<&SourcePackage>)> = Vec::new();
-        for source in sources {
-            match locations.iter_mut().find(|(l, _)| *l == &source.location) {
-                Some((_, packages)) => packages.push(source),
-                None => locations.push((&source.location, vec![source])),
-            }
+        let earlier: Vec<Option<RepoDataRecord>> = sources
+            .iter()
+            .map(|source| self.earlier(source, subdir).cloned())
+            .collect();
+        if let Some(records) = earlier.iter().cloned().collect::<Option<Vec<_>>>() {
+            return Ok(records);
         }
 
-        let mut records = Vec::with_capacity(sources.len());
-        for (location, packages) in locations {
-            let earlier = self.builds.iter().find(|(l, s, built)| {
-                l == location
-                    && (*s == subdir
-                        || built
-                            .iter()
-                            .all(|r| r.package_record.subdir == Subdir::NoArch.as_str()))
-            });
-            let built = match earlier {
-                Some((_, _, built)) => built,
-                None => {
-                    let built = self.build_location(location, &packages, subdir)?;
-                    self.builds.push((location.clone(), subdir, built));
-                    &self.builds.last().expect("just pushed").2
-                }
-            };
-            records.extend(select_packages(built, &packages, location, subdir)?);
-        }
+        let built = self.publish(sources, subdir)?;
+        let records = sources
+            .iter()
+            .zip(earlier)
+            .map(|(source, earlier)| match earlier {
+                Some(record) => Ok(record),
+                None => select_package(&built, source, subdir),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.built
+            .extend(built.into_iter().map(|record| (subdir, record)));
         Ok(records)
     }
 
-    /// Run `pixi build` for the package at `location` and return all packages it produced.
-    fn build_location(
-        &self,
-        location: &UrlOrPath,
-        packages: &[&SourcePackage],
+    /// Run `pixi publish` for the manifests of `sources` and return all packages it built.
+    fn publish(
+        &mut self,
+        sources: &[SourcePackage],
         subdir: Subdir,
     ) -> Result<Vec<RepoDataRecord>> {
-        let names = names(packages);
-        let manifest = match location {
-            UrlOrPath::Path(path) => self.workspace_dir.join(path.as_str()),
-            UrlOrPath::Url(url) => bail!(
-                "cannot build source package {names} from {url}: only source packages in a \
-                 local directory can be built. Build it with `pixi build` and use `--skip {}` \
-                 with `--inject`",
-                packages[0].name.as_source()
-            ),
-        };
-        let output = self.output_dir.join(self.builds.len().to_string());
+        let mut manifests: Vec<PathBuf> = Vec::new();
+        for source in sources {
+            let manifest = match &source.location {
+                UrlOrPath::Path(path) => self.workspace_dir.join(path.as_str()),
+                UrlOrPath::Url(url) => bail!(
+                    "cannot build source package {} from {url}: only source packages in a \
+                     local directory can be built. Build it with `pixi publish` and use \
+                     `--skip {}` with `--inject`",
+                    source.name.as_source(),
+                    source.name.as_source()
+                ),
+            };
+            if !manifests.contains(&manifest) {
+                manifests.push(manifest);
+            }
+        }
+        let output = self.output_dir.join(self.builds.to_string());
+        self.builds += 1;
         std::fs::create_dir_all(&output)
             .with_context(|| format!("could not create {}", output.display()))?;
 
+        let names = sources
+            .iter()
+            .map(|p| p.name.as_source())
+            .collect::<Vec<_>>()
+            .join(", ");
         eprintln!(
-            "🏗️  Building source package {names} for {} with pixi build",
+            "🏗️  Building {names} for {} with pixi publish",
             subdir.as_str()
         );
-        run_pixi_build(&manifest, subdir, &output)
-            .with_context(|| format!("could not build source package {names}"))?;
+        run_pixi_publish(&manifests, subdir, &output)
+            .with_context(|| format!("could not build source packages {names}"))?;
         let built = built_records(&output)?;
         for record in &built {
             eprintln!("📦 Built {}", record.identifier);
@@ -113,71 +132,61 @@ impl SourceBuilder {
     }
 }
 
-fn names(packages: &[&SourcePackage]) -> String {
-    packages
-        .iter()
-        .map(|p| p.name.as_source())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Pick the package of each of `packages` from the packages `built` at `location`.
-fn select_packages(
+/// Pick the package of `source` from the packages `built` for `subdir`.
+fn select_package(
     built: &[RepoDataRecord],
-    packages: &[&SourcePackage],
-    location: &UrlOrPath,
+    source: &SourcePackage,
     subdir: Subdir,
-) -> Result<Vec<RepoDataRecord>> {
-    packages
+) -> Result<RepoDataRecord> {
+    let mut matching = built
         .iter()
-        .map(|package| {
-            let mut matching = built
+        .filter(|r| r.package_record.name == source.name);
+    let record = match (matching.next(), matching.next()) {
+        (Some(record), None) => record,
+        (None, _) => bail!(
+            "`pixi publish` did not produce source package {} from {} (built: {})",
+            source.name.as_source(),
+            source.location,
+            built
                 .iter()
-                .filter(|r| r.package_record.name == package.name);
-            let record = match (matching.next(), matching.next()) {
-                (Some(record), None) => record,
-                (None, _) => bail!(
-                    "`pixi build` of {location} did not produce source package {} (built: {})",
-                    package.name.as_source(),
-                    built
-                        .iter()
-                        .map(|r| r.identifier.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                (Some(_), Some(_)) => bail!(
-                    "`pixi build` of {location} produced several variants of source package {}",
-                    package.name.as_source()
-                ),
-            };
-            let package_subdir = &record.package_record.subdir;
-            if package_subdir != subdir.as_str() && package_subdir != Subdir::NoArch.as_str() {
-                bail!(
-                    "source package {} was built for {package_subdir}, not {} or noarch",
-                    record.identifier,
-                    subdir.as_str()
-                );
-            }
-            Ok(record.clone())
-        })
-        .collect()
+                .map(|r| r.identifier.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Some(_), Some(_)) => bail!(
+            "`pixi publish` produced several variants of source package {}",
+            source.name.as_source()
+        ),
+    };
+    let package_subdir = &record.package_record.subdir;
+    if package_subdir != subdir.as_str() && package_subdir != Subdir::NoArch.as_str() {
+        bail!(
+            "source package {} was built for {package_subdir}, not {} or noarch",
+            record.identifier,
+            subdir.as_str()
+        );
+    }
+    Ok(record.clone())
 }
 
-/// Run `pixi build` for the package at `manifest` (a directory or manifest file).
-fn run_pixi_build(manifest: &Path, subdir: Subdir, output: &Path) -> Result<()> {
-    if !manifest.exists() {
-        bail!("{} does not exist", manifest.display());
+/// Run `pixi publish` for the packages at `manifests` (directories or manifest files),
+/// copying the built packages to `output`.
+fn run_pixi_publish(manifests: &[PathBuf], subdir: Subdir, output: &Path) -> Result<()> {
+    if let Some(missing) = manifests.iter().find(|m| !m.exists()) {
+        bail!("{} does not exist", missing.display());
     }
     let pixi = pixi_executable();
     let mut command = Command::new(&pixi);
     command
-        .arg("build")
+        .arg("publish")
         .arg("--target-platform")
         .arg(subdir.as_str())
-        .arg("--output-dir")
-        .arg(output)
-        .arg("--path")
-        .arg(manifest)
+        .arg("--target-dir")
+        .arg(output);
+    for manifest in manifests {
+        command.arg("--path").arg(manifest);
+    }
+    command
         // The image may be written to stdout, so pixi's output goes to stderr.
         .stdout(Stdio::from(std::io::stderr()))
         .stdin(Stdio::null());
@@ -256,7 +265,7 @@ mod tests {
     #[test]
     fn quotes_command_lines() {
         let mut command = Command::new("pixi");
-        command.args(["build", "--path", "my dir"]);
-        assert_eq!(command_line(&command), "pixi build --path 'my dir'");
+        command.args(["publish", "--path", "my dir"]);
+        assert_eq!(command_line(&command), "pixi publish --path 'my dir'");
     }
 }

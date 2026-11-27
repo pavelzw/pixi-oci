@@ -126,7 +126,7 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 
 ### Source packages (pixi-build)
 
-Source packages in the lockfile, such as your own project built with [pixi-build](https://pixi.sh/latest/build/getting_started/), are built with `pixi build --target-platform <platform>` and installed like any other package. This needs `pixi` on the `PATH` (or `PIXI_EXE` pointing to it), just like `pixi-pack`.
+Source packages in the lockfile, such as your own project built with [pixi-build](https://pixi.sh/latest/build/getting_started/), are built with `pixi publish --target-platform <platform> --target-dir <tmp> --path <package>` and installed like any other package. All source packages of a platform are built in one `pixi publish`, so they may depend on each other. This needs `pixi` on the `PATH` (or `PIXI_EXE` pointing to it), just like `pixi-pack`.
 
 ```toml
 [workspace]
@@ -137,9 +137,9 @@ platforms = ["linux-64", "linux-aarch64"]
 myapp = { path = "." }
 ```
 
-Each source location is built once per platform, even when several images use it, and a noarch build serves all platforms. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`: an injected package replaces the source package of the same name, which is then not built. `--skip` leaves a source package out entirely.
+Source packages are built once per platform, even when several images use them, and a noarch build serves all platforms. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`: an injected package replaces the source package of the same name, which is then not built. `--skip` leaves a source package out entirely.
 
-Compiled packages are cross-compiled for the target platform, which `pixi build` does not support on every host for every backend. If building for a linux platform fails on your machine, build on a linux host of that architecture, or build the package there and pass it with `--inject`.
+Compiled packages are cross-compiled for the target platform, which `pixi publish` does not support on every host for every backend. If building for a linux platform fails on your machine, build on a linux host of that architecture, or build the package there and pass it with `--inject`.
 
 ### Inject additional packages
 
