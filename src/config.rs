@@ -608,6 +608,23 @@ exposed-ports = [8080]
     }
 
     #[test]
+    fn empty_lists_leave_config_fields_unset() {
+        let config = |toml: &str| {
+            parse(toml)
+                .tool
+                .pixi_oci
+                .oci_config
+                .to_oci_config()
+                .unwrap()
+        };
+        let set = config("[tool.pixi-oci.oci-config]\nvolumes = [\"/data\"]\n");
+        assert_eq!(set.volumes().as_deref(), Some(&["/data".to_string()][..]));
+        let empty = config("[tool.pixi-oci.oci-config]\nvolumes = []\nexposed-ports = []\n");
+        assert!(empty.volumes().is_none());
+        assert!(empty.exposed_ports().is_none());
+    }
+
+    #[test]
     fn parses_one_or_many_platforms() {
         let platforms = |toml: &str| parse(toml).tool.pixi_oci.platform.map(|p| p.to_vec());
         assert_eq!(
