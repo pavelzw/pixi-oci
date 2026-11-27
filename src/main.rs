@@ -20,7 +20,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Build an image from the `[tool.pixi-oci]` section of a pixi manifest.
-    Build(BuildArgs),
+    Build(Box<BuildArgs>),
     /// Generate shell completions.
     Completion {
         #[arg(value_enum)]
@@ -30,11 +30,16 @@ enum Command {
 
 #[derive(clap::Args, Debug)]
 struct BuildArgs {
+    /// Images of `[tool.pixi-oci.images]` to build (default: all of them).
+    #[arg(value_name = "IMAGE")]
+    images: Vec<String>,
+
     /// Path to `pixi.toml`, `pyproject.toml` or the directory containing it.
     #[arg(long, default_value = ".")]
     manifest_path: PathBuf,
 
     /// The pixi environment to install (default: `environment` from the config, else `default`).
+    /// Needs a single image.
     #[arg(short, long)]
     environment: Option<String>,
 
@@ -44,6 +49,7 @@ struct BuildArgs {
     platform: Vec<String>,
 
     /// Output path. `-` writes the tarball to stdout. Defaults to `<name>.tar` or `<name>/`.
+    /// Needs a single image.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -51,7 +57,8 @@ struct BuildArgs {
     #[arg(long, value_enum, default_value_t = Format::OciTar)]
     format: Format,
 
-    /// Image reference as `name:tag` or `name`; overrides `tag` from the config.
+    /// Image reference as `name:tag` or `name`; overrides `tag` from the config. Needs a single
+    /// image.
     #[arg(short, long)]
     tag: Option<String>,
 
@@ -113,8 +120,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Build(args) => {
-            let report = pixi_oci::build(BuildOptions {
+            let reports = pixi_oci::build(BuildOptions {
                 manifest_path: args.manifest_path,
+                images: args.images,
                 environment: args.environment,
                 platforms: args.platform,
                 output: args.output,
@@ -126,23 +134,26 @@ async fn main() -> Result<()> {
                 skip_validation: args.skip_validation,
             })
             .await?;
-            if let Some(index) = &report.index_digest {
-                tracing::info!("index {index}");
-            }
-            for image in &report.images {
-                tracing::info!(
-                    "{}: manifest {} config {} ({} base + {} package layers{})",
-                    image.subdir.as_str(),
-                    image.manifest_digest,
-                    image.config_digest,
-                    image.base_layers,
-                    image.package_layers,
-                    if image.copy_layer {
-                        " + copy layer"
-                    } else {
-                        ""
-                    }
-                );
+            for report in &reports {
+                if let Some(index) = &report.index_digest {
+                    tracing::info!("{}: index {index}", report.reference);
+                }
+                for image in &report.images {
+                    tracing::info!(
+                        "{} {}: manifest {} config {} ({} base + {} package layers{})",
+                        report.reference,
+                        image.subdir.as_str(),
+                        image.manifest_digest,
+                        image.config_digest,
+                        image.base_layers,
+                        image.package_layers,
+                        if image.copy_layer {
+                            " + copy layer"
+                        } else {
+                            ""
+                        }
+                    );
+                }
             }
         }
         Command::Completion { shell } => {

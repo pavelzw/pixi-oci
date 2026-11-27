@@ -78,6 +78,8 @@ struct ImageConfig {
 struct InnerConfig {
     #[serde(rename = "Entrypoint")]
     entrypoint: Option<Vec<String>>,
+    #[serde(rename = "Cmd")]
+    cmd: Option<Vec<String>>,
     #[serde(rename = "Env")]
     env: Vec<String>,
 }
@@ -239,6 +241,7 @@ async fn build_example(
     })
     .await
     .expect("build succeeds")
+    .remove(0)
 }
 
 #[rstest]
@@ -506,7 +509,8 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
 
     let archive = Archive::open(&out);
     archive.verify_digests();
@@ -557,7 +561,8 @@ async fn builds_multi_platform_index(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     assert_eq!(report.images.len(), 2);
 
     let archive = Archive::open(&out);
@@ -660,7 +665,8 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     let archive = Archive::open(&out);
     let files: HashMap<String, Vec<u8>> = archive.manifest().layers
         [report.images[0].rootfs_layers..][..report.images[0].package_layers]
@@ -714,6 +720,115 @@ fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
         digests.push(sha256_hex(&fs::read(&out).unwrap()));
     }
     assert_eq!(digests[0], digests[1], "builds must be reproducible");
+}
+
+/// A copy of the example project on a scratch base whose `[tool.pixi-oci]` table is the default
+/// for the given `images` tables instead of an image of its own.
+fn example_with_images(dir: &Path, images: &str) -> PathBuf {
+    let project = example_with_base(dir, "scratch");
+    let manifest = fs::read_to_string(project.join("pixi.toml")).unwrap();
+    let manifest = manifest.replace("tag = \"example-project\"\n", "");
+    fs::write(project.join("pixi.toml"), format!("{manifest}\n{images}")).unwrap();
+    project
+}
+
+#[rstest]
+fn cli_builds_all_images(tmpdir: tempfile::TempDir) {
+    let project = example_with_images(
+        tmpdir.path(),
+        r#"
+[tool.pixi-oci.images.web]
+platform = "linux-64"
+oci-config.cmd = ["--listen", ":80"]
+
+[tool.pixi-oci.images.web-arm]
+tag = "web-arm:1.0"
+platform = "linux-aarch64"
+copy-to-image = []
+"#,
+    );
+    let pixi_oci = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pixi-oci"))
+            .args(["build", "--manifest-path"])
+            .arg(&project)
+            .args(args)
+            .current_dir(tmpdir.path())
+            .output()
+            .expect("pixi-oci runs")
+    };
+
+    let output = pixi_oci(&[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let web = Archive::open(&tmpdir.path().join("web.tar"));
+    let web_arm = Archive::open(&tmpdir.path().join("web-arm.tar"));
+    let index = web.index();
+    assert_eq!(
+        index.manifests[0].annotations["org.opencontainers.image.ref.name"],
+        "web:latest"
+    );
+    let config = web.config();
+    assert_eq!(config.architecture, "amd64");
+    assert_eq!(
+        config.config.cmd,
+        Some(vec!["--listen".to_string(), ":80".to_string()])
+    );
+    // Both inherit the entrypoint; only `web` has the copy layer.
+    let config_arm = web_arm.config();
+    assert_eq!(config_arm.architecture, "arm64");
+    assert_eq!(config_arm.config.entrypoint, config.config.entrypoint);
+    assert_eq!(
+        web_arm.index().manifests[0].annotations["org.opencontainers.image.ref.name"],
+        "web-arm:1.0"
+    );
+    assert_eq!(
+        web.manifest().layers.len(),
+        web_arm.manifest().layers.len() + 1
+    );
+
+    // Selecting one image builds only that one, and allows --output.
+    let out = tmpdir.path().join("selected.tar");
+    let output = pixi_oci(&["web-arm", "--output", out.to_str().unwrap()]);
+    assert!(output.status.success());
+    assert_eq!(Archive::open(&out).config().architecture, "arm64");
+
+    // --output with several images is ambiguous.
+    let output = pixi_oci(&["--output", "x.tar"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output needs a single image"), "{stderr}");
+
+    let output = pixi_oci(&["nope"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Available images: web, web-arm"),
+        "{stderr}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn rejects_images_with_the_same_output(tmpdir: tempfile::TempDir) {
+    let project = example_with_images(
+        tmpdir.path(),
+        "[tool.pixi-oci.images.a]\ntag = \"app:a\"\n[tool.pixi-oci.images.b]\ntag = \"app:b\"\n",
+    );
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: project,
+        platforms: vec!["linux-64".to_string()],
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("images `a` and `b` would both be written to app.tar"),
+        "{err}"
+    );
 }
 
 #[rstest]
