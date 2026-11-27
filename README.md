@@ -87,7 +87,7 @@ stop-signal = "SIGTERM"
 `base` is either a registry reference or a table describing a root filesystem built from scratch:
 
 ```toml
-# a public registry image, pulled anonymously
+# a registry image
 base = "ubuntu:latest"
 
 # from scratch, with glibc and a shadow setup (the default, same as `base = {}`)
@@ -102,6 +102,16 @@ base = { shadow-setup = false, glibc = false }
 
 - `glibc` adds Debian's `libc6` package, downloaded from [snapshot.debian.org](https://snapshot.debian.org/binary/libc6/) and verified against the archive's checksum. `true` means `2.41-12+deb13u4` (Debian 13); a string is any Debian `libc6` version. The layer has the libraries, the dynamic loader reachable as `/lib64/ld-linux-x86-64.so.2` (or the platform's equivalent) and `/etc/nsswitch.conf`.
 - `shadow-setup` adds `/etc/passwd`, `/etc/group`, `/etc/shadow` and `/etc/gshadow` with `root` and `nobody`, plus `/root` and a world-writable `/tmp`, like [`shadowSetup`](https://nixos.org/manual/nixpkgs/stable/#ssec-pkgs-dockerTools-shadowSetup) in nixpkgs.
+
+#### Private base images
+
+Registry images are pulled with the first credentials found for their registry:
+
+1. `PIXI_OCI_REGISTRY_USERNAME` and `PIXI_OCI_REGISTRY_PASSWORD`
+2. the auth files of podman and skopeo: `$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json` and `$XDG_CONFIG_HOME/containers/auth.json` (default `~/.config/containers/auth.json`)
+3. the docker config, `$DOCKER_CONFIG/config.json` (default `~/.docker/config.json`), including credential helpers (`credsStore`, `credHelpers`)
+
+Without credentials, the image is pulled anonymously. So `docker login`, `podman login` or [`docker/login-action`](https://github.com/docker/login-action) in GitHub Actions are enough. Identity tokens (e.g. from `az acr login`) are not supported; use a username and password instead. Registries on `localhost` or `127.0.0.1` are accessed over plain HTTP, like docker does.
 
 Builds of `pixi-oci` with the `bundled-glibc` cargo feature embed the default `libc6` packages for `amd64` and `arm64`, so they are not downloaded at runtime. Other versions and architectures are still downloaded.
 
