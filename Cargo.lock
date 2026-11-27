@@ -2663,6 +2663,7 @@ dependencies = [
  "ureq",
  "url",
  "walkdir",
+ "webpki-root-certs",
 ]
 
 [[package]]

@@ -43,7 +43,7 @@ use crate::{
         prepend_entrypoint, write_index,
     },
     inject::{inject_packages, validate_environment},
-    install::{install_environment, load_config, reqwest_client_from_config},
+    install::{RattlerConfig, install_environment, load_config, reqwest_client_from_config},
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::{LockedEnvironment, load_locked_environments},
     rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
@@ -176,6 +176,7 @@ struct SharedContext<'a> {
     skip_validation: bool,
     format: OutputFormat,
     cache_dir: PathBuf,
+    rattler_config: &'a RattlerConfig,
     client: reqwest_middleware::ClientWithMiddleware,
     created: chrono::DateTime<chrono::Utc>,
 }
@@ -194,6 +195,7 @@ struct BuildContext<'a> {
     skip_validation: bool,
     reference: &'a str,
     cache_dir: &'a Path,
+    rattler_config: &'a RattlerConfig,
     client: &'a reqwest_middleware::ClientWithMiddleware,
     output_oci: &'a OciDir,
     created: chrono::DateTime<chrono::Utc>,
@@ -281,6 +283,7 @@ pub async fn build(options: BuildOptions) -> Result<Vec<BuildReport>> {
         // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
         cache_dir: rattler_cache::default_cache_dir()
             .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?,
+        rattler_config: &rattler_config,
         client: reqwest_client_from_config(&rattler_config)?,
         created: created_timestamp(),
     };
@@ -437,6 +440,7 @@ async fn build_image(shared: &SharedContext<'_>, plan: ImagePlan) -> Result<Buil
         skip_validation: shared.skip_validation,
         reference: &reference,
         cache_dir: &shared.cache_dir,
+        rattler_config: shared.rattler_config,
         client: &shared.client,
         output_oci: &output_oci,
         created: shared.created,
@@ -582,7 +586,9 @@ async fn build_platform(
     let (base, rootfs_layers) = match ctx.base_spec {
         BaseSpec::Image(_) => {
             let base = match ctx.base_source {
-                Some(source) => Some(fetch_base_image(source, &platform, ctx.output_oci).await?),
+                Some(source) => Some(
+                    fetch_base_image(source, &platform, ctx.output_oci, ctx.rattler_config).await?,
+                ),
                 None => None,
             };
             (base, Vec::new())

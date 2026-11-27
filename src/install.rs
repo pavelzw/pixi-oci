@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use rattler::install::{IndicatifReporter, Installer, LinkOptions};
 use rattler_cache::{PACKAGE_CACHE_DIR, package_cache::PackageCache};
 use rattler_conda_types::{RepoDataRecord, Subdir};
+use rattler_config::config::tls::TlsRootCerts;
 use rattler_networking::{
     AuthenticationMiddleware, AuthenticationStorage, MirrorMiddleware,
     authentication_storage::backends::file::FileStorage, proxy::proxies_from_config,
@@ -25,7 +26,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Option<RattlerConfig>> {
     .transpose()
 }
 
-/// Create a download client like pixi does: mirrors, proxies, TLS verification and the
+/// Create a download client like pixi does: mirrors, proxies, TLS settings and the
 /// authentication file are taken from `config`.
 // TODO: use rattler's client construction from a config once it provides one.
 pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMiddleware> {
@@ -48,6 +49,14 @@ pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMi
         .user_agent(format!("pixi-oci/{}", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(5 * 60))
         .danger_accept_invalid_certs(config.tls_no_verify.unwrap_or(false));
+    if let Some(roots) = tls_root_certs_only(config) {
+        let roots = roots
+            .iter()
+            .map(|der| reqwest::Certificate::from_der(der))
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid root certificate")?;
+        builder = builder.tls_certs_only(roots);
+    }
     for proxy in proxies_from_config(&config.proxy_config).context("invalid proxy configuration")? {
         builder = builder.proxy(proxy);
     }
@@ -69,6 +78,22 @@ pub fn reqwest_client_from_config(config: &RattlerConfig) -> Result<ClientWithMi
     )))
     .build();
     Ok(client)
+}
+
+/// The DER-encoded root certificates to trust exclusively, or `None` to keep the TLS backend's
+/// default: the system certificate store, for both `rustls` (through
+/// `rustls-platform-verifier`) and `native-tls`. `tls-root-certs = "webpki"` selects the bundled
+/// Mozilla root certificates instead.
+pub fn tls_root_certs_only(config: &RattlerConfig) -> Option<Vec<&'static [u8]>> {
+    match config.tls_root_certs.unwrap_or_default() {
+        TlsRootCerts::Webpki => Some(
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .map(|cert| cert.as_ref())
+                .collect(),
+        ),
+        TlsRootCerts::System => None,
+    }
 }
 
 /// Install `records` into `staging_prefix` on the host. Hardcoded prefix paths inside the files
@@ -111,4 +136,24 @@ pub async fn install_environment(
         .context("could not create conda-meta/history")?;
 
     Ok(result.transaction.operations.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_roots_are_the_default() {
+        assert_eq!(tls_root_certs_only(&RattlerConfig::default()), None);
+    }
+
+    #[test]
+    fn download_client_builds_with_webpki_roots() {
+        let config: RattlerConfig = toml::from_str(r#"tls-root-certs = "webpki""#).unwrap();
+        assert_eq!(
+            tls_root_certs_only(&config).map(|roots| roots.len()),
+            Some(webpki_root_certs::TLS_SERVER_ROOT_CERTS.len())
+        );
+        reqwest_client_from_config(&config).unwrap();
+    }
 }
