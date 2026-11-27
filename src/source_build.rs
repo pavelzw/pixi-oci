@@ -15,7 +15,12 @@ use crate::{inject::injected_record, lockfile::SourcePackage};
 
 /// The pixi executable: `PIXI_EXE` (set by `pixi run`), else `pixi` from `PATH`.
 fn pixi_executable() -> OsString {
-    std::env::var_os("PIXI_EXE")
+    pixi_executable_from(std::env::var_os("PIXI_EXE"))
+}
+
+/// The pixi executable for the value of `PIXI_EXE`; an empty one counts as unset.
+fn pixi_executable_from(pixi_exe: Option<OsString>) -> OsString {
+    pixi_exe
         .filter(|exe| !exe.is_empty())
         .unwrap_or_else(|| "pixi".into())
 }
@@ -297,6 +302,83 @@ mod tests {
         let records = built_records(&packages).unwrap();
         let names: Vec<_> = records.iter().map(|r| r.identifier.to_string()).collect();
         assert_eq!(names, ["greeter-1.0-0.tar.bz2"]);
+    }
+
+    #[test]
+    fn finds_the_pixi_executable() {
+        assert_eq!(pixi_executable_from(None), "pixi");
+        assert_eq!(pixi_executable_from(Some("".into())), "pixi");
+        assert_eq!(
+            pixi_executable_from(Some("/opt/pixi/bin/pixi".into())),
+            "/opt/pixi/bin/pixi"
+        );
+    }
+
+    #[test]
+    fn reuses_builds_for_their_platform_or_as_noarch() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, subdir: &str| {
+            let package = crate::inject::tests::write_package(dir.path(), name, subdir, &[]);
+            injected_record(&package).unwrap()
+        };
+        let source = |name: &str| SourcePackage {
+            name: name.parse().unwrap(),
+            location: UrlOrPath::Path(name.into()),
+            noarch: false,
+        };
+        let mut builder = SourceBuilder::new(dir.path(), dir.path());
+        builder.built = vec![
+            (Subdir::Linux64, record("native", "linux-64")),
+            (Subdir::Linux64, record("generic", "noarch")),
+        ];
+
+        // A package built for one platform only serves that platform.
+        assert!(
+            builder
+                .earlier(&source("native"), Subdir::Linux64)
+                .is_some()
+        );
+        assert!(
+            builder
+                .earlier(&source("native"), Subdir::LinuxAarch64)
+                .is_none()
+        );
+        // A noarch package serves every platform.
+        assert!(
+            builder
+                .earlier(&source("generic"), Subdir::LinuxAarch64)
+                .is_some()
+        );
+        assert!(builder.earlier(&source("other"), Subdir::Linux64).is_none());
+    }
+
+    #[test]
+    fn selects_the_package_for_the_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, subdir: &str| {
+            let out = dir.path().join(subdir);
+            std::fs::create_dir_all(&out).unwrap();
+            let package = crate::inject::tests::write_package(&out, name, subdir, &[]);
+            injected_record(&package).unwrap()
+        };
+        let source = |name: &str| SourcePackage {
+            name: name.parse().unwrap(),
+            location: UrlOrPath::Path(name.into()),
+            noarch: false,
+        };
+        let built = [record("native", "linux-64"), record("generic", "noarch")];
+
+        let selected = select_package(&built, &source("native"), Subdir::Linux64).unwrap();
+        assert_eq!(selected.identifier.to_string(), "native-1.0-0.tar.bz2");
+        assert!(select_package(&built, &source("generic"), Subdir::LinuxAarch64).is_ok());
+
+        let err = select_package(&built, &source("native"), Subdir::LinuxAarch64).unwrap_err();
+        assert!(err.to_string().contains("built for linux-64"), "{err}");
+        let err = select_package(&built, &source("missing"), Subdir::Linux64).unwrap_err();
+        assert!(err.to_string().contains("did not produce"), "{err}");
+        let variants = [record("native", "linux-64"), record("native", "noarch")];
+        let err = select_package(&variants, &source("native"), Subdir::Linux64).unwrap_err();
+        assert!(err.to_string().contains("several variants"), "{err}");
     }
 
     #[test]
