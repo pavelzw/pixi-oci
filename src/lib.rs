@@ -16,6 +16,7 @@ pub mod layers;
 pub mod lockfile;
 pub mod registry_auth;
 pub mod rootfs;
+pub mod source_build;
 
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,7 @@ use crate::{
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::{LockedEnvironment, load_locked_environments},
     rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
+    source_build::SourceBuilder,
 };
 
 /// Output format of a build.
@@ -78,7 +80,7 @@ pub struct BuildOptions {
     pub rattler_config: Option<PathBuf>,
     /// Local conda packages (`.conda` or `.tar.bz2`) to add to the locked environment.
     pub inject: Vec<InjectSpec>,
-    /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
+    /// Locked conda packages to leave out, binary or source.
     pub skip: Vec<PackageName>,
     /// Don't check that the dependencies and constraints of all packages are satisfied.
     pub skip_validation: bool,
@@ -172,8 +174,6 @@ struct ImagePlan {
 /// Settings shared by all images of a build.
 struct SharedContext<'a> {
     loaded: &'a LoadedManifest,
-    inject: &'a [InjectSpec],
-    skip_validation: bool,
     format: OutputFormat,
     cache_dir: PathBuf,
     rattler_config: &'a RattlerConfig,
@@ -191,8 +191,6 @@ struct BuildContext<'a> {
     base_spec: &'a BaseSpec,
     base_source: Option<&'a BaseImageSource>,
     activation_shell: &'a str,
-    inject: &'a [InjectSpec],
-    skip_validation: bool,
     reference: &'a str,
     cache_dir: &'a Path,
     rattler_config: &'a RattlerConfig,
@@ -229,7 +227,7 @@ pub async fn build(options: BuildOptions) -> Result<Vec<BuildReport>> {
 
     // Check everything that doesn't need the network, for all images, before downloading
     // anything.
-    let plans = images
+    let mut plans = images
         .into_iter()
         .map(|(name, cfg)| {
             let label = name.clone();
@@ -274,11 +272,22 @@ pub async fn build(options: BuildOptions) -> Result<Vec<BuildReport>> {
         }
     }
 
+    // Complete the environments of all images: inject local packages, build the source
+    // packages that weren't replaced by one and check the result. Images share the builds.
+    let source_builds = TempDir::new("pixi-oci-source-builds-")?;
+    let mut source_builder = SourceBuilder::new(&loaded.dir, source_builds.path());
+    for plan in &mut plans {
+        complete_environments(plan, &options, &mut source_builder).with_context(
+            || match &plan.name {
+                Some(name) => format!("invalid image `{name}`"),
+                None => "invalid image".to_string(),
+            },
+        )?;
+    }
+
     let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
     let shared = SharedContext {
         loaded: &loaded,
-        inject: &options.inject,
-        skip_validation: options.skip_validation,
         format: options.format,
         // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
         cache_dir: rattler_cache::default_cache_dir()
@@ -366,16 +375,6 @@ fn plan_image(
     for l in &locked {
         target_platform(l.subdir)?;
     }
-    if let BaseSpec::Scratch(scratch) = &base_spec {
-        let glibc = scratch
-            .glibc
-            .debian_version()
-            .map(upstream_glibc_version)
-            .transpose()?;
-        for l in &locked {
-            check_glibc(&l.records, glibc.as_ref())?;
-        }
-    }
     let base_source = match &base_spec {
         BaseSpec::Image(image) => BaseImageSource::resolve(image)?,
         BaseSpec::Scratch(_) => None,
@@ -395,6 +394,54 @@ fn plan_image(
         output_path,
         locked,
     })
+}
+
+/// Inject the local packages into the environments of `plan`, build its source packages that
+/// weren't replaced by one, and check that the environments are consistent.
+fn complete_environments(
+    plan: &mut ImagePlan,
+    options: &BuildOptions,
+    source_builder: &mut SourceBuilder,
+) -> Result<()> {
+    for l in &mut plan.locked {
+        let inject: Vec<&Path> = options
+            .inject
+            .iter()
+            .filter(|spec| spec.applies_to(&l.platform, l.subdir))
+            .map(|spec| spec.path.as_path())
+            .collect();
+        inject_packages(&mut l.records, &inject, l.subdir)?;
+        // An injected package replaces a source package of the same name, whose build is not
+        // used.
+        let needed: Vec<_> = l
+            .sources
+            .iter()
+            .filter(|source| {
+                !l.records
+                    .iter()
+                    .any(|r| r.package_record.name == source.name)
+            })
+            .collect();
+        if !needed.is_empty() {
+            let built = source_builder.build(&l.sources, &needed, l.subdir)?;
+            l.records.extend(built);
+        }
+        if !options.skip_validation {
+            validate_environment(&l.records)
+                .with_context(|| format!("invalid environment for {}", l.subdir.as_str()))?;
+        }
+    }
+    if let BaseSpec::Scratch(scratch) = &plan.base_spec {
+        let glibc = scratch
+            .glibc
+            .debian_version()
+            .map(upstream_glibc_version)
+            .transpose()?;
+        for l in &plan.locked {
+            check_glibc(&l.records, glibc.as_ref())?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the images of all platforms of one image and write its layout.
@@ -436,8 +483,6 @@ async fn build_image(shared: &SharedContext<'_>, plan: ImagePlan) -> Result<Buil
         base_spec: &base_spec,
         base_source: base_source.as_ref(),
         activation_shell: &activation_shell,
-        inject: shared.inject,
-        skip_validation: shared.skip_validation,
         reference: &reference,
         cache_dir: &shared.cache_dir,
         rattler_config: shared.rattler_config,
@@ -555,21 +600,10 @@ async fn build_image(shared: &SharedContext<'_>, plan: ImagePlan) -> Result<Buil
 /// Install the environment for one platform and write its layers, config and manifest.
 async fn build_platform(
     ctx: &BuildContext<'_>,
-    mut locked: LockedEnvironment,
+    locked: LockedEnvironment,
 ) -> Result<PlatformImage> {
     let subdir = locked.subdir;
     let platform = target_platform(subdir)?;
-    let inject: Vec<&Path> = ctx
-        .inject
-        .iter()
-        .filter(|spec| spec.applies_to(&locked.platform, subdir))
-        .map(|spec| spec.path.as_path())
-        .collect();
-    inject_packages(&mut locked.records, &inject, subdir)?;
-    if !ctx.skip_validation {
-        validate_environment(&locked.records)
-            .with_context(|| format!("invalid environment for {}", subdir.as_str()))?;
-    }
     eprintln!(
         "🔧 Building {} for {} (environment `{}`, {} packages)",
         ctx.reference,

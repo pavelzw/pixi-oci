@@ -19,7 +19,8 @@ pixi-oci build -e prod -p linux-aarch64 -t myapp:1.2.3 -o myapp.tar
 pixi-oci build -p linux-64 -p linux-aarch64
 pixi-oci build --format oci-dir -o ./myapp
 pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
-pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.condapixi-oci build server worker   # only these of [tool.pixi-oci.images]
+pixi-oci build --skip libfoo
+pixi-oci build server worker   # only these of [tool.pixi-oci.images]
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -123,6 +124,23 @@ When packages ship `etc/conda/activate.d/*.sh` scripts, `pixi-oci` also writes a
 
 `[activation]` tables from the manifest (`env` and `scripts`) are not applied.
 
+### Source packages (pixi-build)
+
+Source packages in the lockfile, such as your own project built with [pixi-build](https://pixi.sh/latest/build/getting_started/), are built with `pixi publish --target-platform <platform> --target-dir <tmp> --path <package>` and installed like any other package. All source packages of a platform are built in one `pixi publish`, so they may depend on each other. This needs `pixi` on the `PATH` (or `PIXI_EXE` pointing to it), just like `pixi-pack`.
+
+```toml
+[workspace]
+preview = ["pixi-build"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[dependencies]
+myapp = { path = "." }
+```
+
+Source packages are built once per platform, even when several images use them, and a noarch build serves all platforms. When the lockfile marks every source package as noarch, they are built for the host platform, so their build tools run natively. An injected package replaces the source package of the same name in the image, but the source package is still built with the others, because `pixi publish` refuses packages whose source dependencies it doesn't build too. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`. `--skip` leaves a source package out entirely.
+
+Compiled packages are cross-compiled for the target platform, which `pixi publish` does not support on every host for every backend. If building for a linux platform fails on your machine, build on a linux host of that architecture, or build the package there and pass it with `--inject`.
+
 ### Inject additional packages
 
 `--inject` adds local conda packages (`.conda` or `.tar.bz2`) that are not part of `pixi.lock` to the environment. This is useful to put a freshly built package of your project into the image while still using the project's lockfile:
@@ -161,18 +179,13 @@ skopeo copy --multi-arch all oci-archive:myapp.tar docker://ghcr.io/you/myapp:1.
 
 ### Skip locked packages
 
-`--skip <name>` leaves a locked conda package out of the environment. Combined with `--inject`, this puts a pixi-build source package into the image, which `pixi-oci` can't build itself:
-
-```shell
-pixi build --target-platform linux-64 --output-dir dist
-pixi-oci build --skip myapp --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
-```
+`--skip <name>` leaves a locked conda package, binary or source, out of the environment. The environment is still validated, so skip packages nothing else depends on, replace them with `--inject`, or pass `--skip-validation`.
 
 ## Limitations
 
 - PyPI dependencies in the lockfile are rejected. Use conda packages for now.
 - Only `[tool.pixi-oci]` is read from the manifest. `[activation]` tables are ignored, and `pixi.lock` is not checked against the manifest, so run `pixi lock` after changing dependencies.
-- Source packages (pixi-build) are not built; build them with `pixi build` and use `--skip` with `--inject`.
+- Source packages (pixi-build) are only built from local directories, see [Source packages](#source-packages-pixi-build).
 - `pixi-oci` does not push to registries itself. Use `skopeo copy oci-archive:...` or `podman push`.
 
 ## Development

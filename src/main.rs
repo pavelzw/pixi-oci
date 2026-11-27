@@ -67,13 +67,13 @@ struct BuildArgs {
     config: Option<PathBuf>,
 
     /// Inject an additional local conda package (`.conda` or `.tar.bz2`) into the environment.
-    /// Replaces a locked package of the same name. Prefix with `PLATFORM:` to inject it only
-    /// for that platform. Can be given multiple times.
+    /// Replaces a locked package of the same name, binary or source. Prefix with `PLATFORM:` to
+    /// inject it only for that platform. Can be given multiple times.
     #[arg(short, long, value_name = "[PLATFORM:]PATH")]
     inject: Vec<InjectSpec>,
 
-    /// Leave a locked conda package out of the environment. Combine with `--inject` to replace
-    /// a source package with a package built by `pixi build`. Can be given multiple times.
+    /// Leave a locked conda package out of the environment; a skipped source package is not
+    /// built. Can be given multiple times.
     #[arg(long, value_name = "PACKAGE")]
     skip: Vec<PackageName>,
 
