@@ -1,0 +1,13 @@
+# A workspace with a pixi-build source package, built by `pixi-oci build` with `pixi build`.
+[workspace]
+channels = ["conda-forge"]
+name = "source-build"
+platforms = ["linux-64", "linux-aarch64"]
+preview = ["pixi-build"]
+
+[dependencies]
+greeter = { path = "greeter" }
+
+[tool.pixi-oci]
+tag = "source-build"
+base = "scratch"

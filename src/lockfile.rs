@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rattler_conda_types::{PackageName, RepoDataRecord, Subdir};
-use rattler_lock::{CondaPackageData, LockFile, LockedPackage};
+use rattler_lock::{CondaPackageData, LockFile, LockedPackage, UrlOrPath};
 
 /// The conda packages locked for one environment on one platform.
 #[derive(Debug)]
@@ -13,7 +13,18 @@ pub struct LockedEnvironment {
     /// The platform name in the lockfile, usually the same as `subdir`.
     pub platform: String,
     pub subdir: Subdir,
+    /// The binary packages, installed as they are.
     pub records: Vec<RepoDataRecord>,
+    /// The source packages (pixi-build), which have to be built first.
+    pub sources: Vec<SourcePackage>,
+}
+
+/// A source package of the lockfile, built with pixi-build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePackage {
+    pub name: PackageName,
+    /// Where the package manifest lives; a relative path is relative to the lockfile.
+    pub location: UrlOrPath,
 }
 
 /// Load the lockfile and resolve the requested environment and platforms, one
@@ -24,9 +35,8 @@ pub struct LockedEnvironment {
 /// environment. Non-linux platforms are rejected, and so are two platforms with the same
 /// subdir, as they would be the same OCI platform.
 ///
-/// Conda packages named in `skip` are left out, including source packages, which can't be
-/// installed otherwise. Every name in `skip` must match a locked conda package on every
-/// platform.
+/// Conda packages named in `skip` are left out, binary or source. Every name in `skip` must
+/// match a locked conda package on every platform.
 pub fn load_locked_environments(
     lockfile_path: &Path,
     environment: &str,
@@ -97,6 +107,7 @@ fn locked_environment(
     })?;
 
     let mut skipped = vec![false; skip.len()];
+    let mut sources = Vec::new();
     let records = packages
         .filter(|package| {
             let Some(name) = package.as_conda().map(CondaPackageData::name) else {
@@ -111,20 +122,23 @@ fn locked_environment(
                 None => true,
             }
         })
-        .map(|package| match package {
+        .filter_map(|package| match package {
             LockedPackage::Conda(CondaPackageData::Binary(binary)) => {
-                RepoDataRecord::try_from(&**binary).with_context(|| {
+                Some(RepoDataRecord::try_from(&**binary).with_context(|| {
                     format!("could not convert locked package {}", binary.file_name)
-                })
+                }))
             }
-            LockedPackage::Conda(CondaPackageData::Source(source)) => Err(anyhow!(
-                "source package {} is not supported",
-                source.location
-            )),
-            LockedPackage::Pypi(_) => Err(anyhow!(
+            LockedPackage::Conda(CondaPackageData::Source(source)) => {
+                sources.push(SourcePackage {
+                    name: source.name().clone(),
+                    location: source.location.clone(),
+                });
+                None
+            }
+            LockedPackage::Pypi(_) => Some(Err(anyhow!(
                 "PyPI package {} is not supported, use conda packages instead",
                 package.location()
-            )),
+            ))),
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -147,6 +161,7 @@ fn locked_environment(
         platform: platform.name().as_str().to_string(),
         subdir,
         records,
+        sources,
     })
 }
 
@@ -278,15 +293,23 @@ packages:
     }
 
     #[test]
-    fn rejects_source_packages() {
-        let err = load(&[]).unwrap_err();
-        assert!(err.to_string().contains("source package"), "{err}");
+    fn collects_source_packages() {
+        let env = load(&[]).unwrap();
+        assert_eq!(names(&env), ["caddy"]);
+        assert_eq!(
+            env.sources,
+            [SourcePackage {
+                name: "myapp".parse().unwrap(),
+                location: UrlOrPath::Path(".".into()),
+            }]
+        );
     }
 
     #[test]
     fn skips_source_packages() {
         let env = load(&["myapp"]).unwrap();
         assert_eq!(names(&env), ["caddy"]);
+        assert!(env.sources.is_empty());
     }
 
     #[test]

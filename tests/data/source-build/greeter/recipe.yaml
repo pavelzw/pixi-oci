@@ -1,0 +1,13 @@
+package:
+  name: greeter
+  version: 0.1.0
+
+build:
+  noarch: generic
+  script:
+    - mkdir -p $PREFIX/share/greeter
+    - echo "hello from greeter" > $PREFIX/share/greeter/greeting.txt
+
+requirements:
+  run:
+    - tzdata

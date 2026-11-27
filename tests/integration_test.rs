@@ -696,6 +696,130 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
     .expect("build succeeds without validation");
 }
 
+/// A copy of the workspace with a pixi-build source package in `dir`.
+fn source_build_workspace(dir: &Path) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/source-build");
+    let workspace = dir.join("source-build");
+    fs::create_dir_all(workspace.join("greeter")).unwrap();
+    for file in [
+        "pixi.toml",
+        "pixi.lock",
+        "greeter/pixi.toml",
+        "greeter/recipe.yaml",
+    ] {
+        fs::copy(source.join(file), workspace.join(file)).unwrap();
+    }
+    workspace
+}
+
+/// The files in the package layers of each image of a multi-platform tarball.
+fn platform_files(out: &Path, report: &pixi_oci::BuildReport) -> Vec<HashMap<String, Vec<u8>>> {
+    let archive = Archive::open(out);
+    let index = archive.index();
+    let nested: Index = serde_json::from_slice(archive.blob(&index.manifests[0].digest)).unwrap();
+    nested
+        .manifests
+        .iter()
+        .zip(&report.images)
+        .map(|(entry, image)| {
+            let manifest: Manifest = serde_json::from_slice(archive.blob(&entry.digest)).unwrap();
+            manifest.layers[..image.package_layers]
+                .iter()
+                .flat_map(|layer| archive.layer_entries(layer))
+                .map(|(name, _, data)| (name, data))
+                .collect()
+        })
+        .collect()
+}
+
+#[rstest]
+#[tokio::test]
+async fn builds_source_packages(tmpdir: tempfile::TempDir) {
+    if !tool_available(&std::env::var("PIXI_EXE").unwrap_or_else(|_| "pixi".to_string())) {
+        eprintln!("pixi not available, skipping");
+        return;
+    }
+    let workspace = source_build_workspace(tmpdir.path());
+    let platforms = vec!["linux-64".to_string(), "linux-aarch64".to_string()];
+    let out = tmpdir.path().join("source-build.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: workspace.clone(),
+        platforms: platforms.clone(),
+        output: Some(out.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+    let files = platform_files(&out, &report);
+    for files in &files {
+        assert_eq!(
+            files["opt/env/share/greeter/greeting.txt"],
+            b"hello from greeter\n"
+        );
+        assert!(
+            files
+                .keys()
+                .any(|f| f.starts_with("opt/env/share/zoneinfo/"))
+        );
+    }
+    // The noarch package is built once and installed on both platforms.
+    let greeter_meta = |files: &HashMap<String, Vec<u8>>| {
+        files
+            .iter()
+            .find(|(name, _)| name.starts_with("opt/env/conda-meta/greeter-0.1.0-"))
+            .map(|(_, data)| data.clone())
+            .expect("greeter is installed")
+    };
+    assert_eq!(greeter_meta(&files[0]), greeter_meta(&files[1]));
+
+    // An injected package of the same name replaces the source package, which isn't built.
+    let greeter = write_conda_package(tmpdir.path(), "greeter", &[]);
+    let out = tmpdir.path().join("injected.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: workspace.clone(),
+        platforms: platforms.clone(),
+        output: Some(out.clone()),
+        inject: vec![greeter.into()],
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+    for files in platform_files(&out, &report) {
+        assert_eq!(files["opt/env/share/greeter.txt"], b"hello from greeter\n");
+        assert!(!files.contains_key("opt/env/share/greeter/greeting.txt"));
+    }
+
+    // A skipped source package isn't built either.
+    let out = tmpdir.path().join("skipped.tar");
+    let report = pixi_oci::build(BuildOptions {
+        manifest_path: workspace.clone(),
+        platforms,
+        output: Some(out.clone()),
+        skip: vec!["greeter".parse().unwrap()],
+        ..Default::default()
+    })
+    .await
+    .expect("build succeeds");
+    for files in platform_files(&out, &report) {
+        assert!(!files.keys().any(|f| f.contains("greeter")));
+    }
+
+    // A source package that fails to build fails the image build.
+    fs::write(workspace.join("greeter/recipe.yaml"), "not: a recipe\n").unwrap();
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: workspace,
+        platforms: vec!["linux-64".to_string()],
+        output: Some(tmpdir.path().join("broken.tar")),
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("could not build source package greeter"),
+        "{err:#}"
+    );
+}
+
 #[rstest]
 fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
     let project = example_with_base(tmpdir.path(), "scratch");

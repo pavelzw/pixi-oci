@@ -15,6 +15,7 @@ pub mod install;
 pub mod layers;
 pub mod lockfile;
 pub mod rootfs;
+pub mod source_build;
 
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ use crate::{
     layers::{PopularitySplitter, plan_copy_layer, plan_package_layers},
     lockfile::{LockedEnvironment, load_locked_environments},
     rootfs::{check_glibc, plan_rootfs_layers, upstream_glibc_version},
+    source_build::SourceBuilder,
 };
 
 /// Output format of a build.
@@ -75,7 +77,7 @@ pub struct BuildOptions {
     pub rattler_config: Option<PathBuf>,
     /// Local conda packages (`.conda` or `.tar.bz2`) to add to the locked environment.
     pub inject: Vec<InjectSpec>,
-    /// Locked conda packages to leave out, e.g. a source package replaced by `inject`.
+    /// Locked conda packages to leave out, binary or source.
     pub skip: Vec<PackageName>,
     /// Don't check that the dependencies and constraints of all packages are satisfied.
     pub skip_validation: bool,
@@ -155,8 +157,6 @@ struct BuildContext<'a> {
     max_layers: std::num::NonZeroUsize,
     base_spec: &'a BaseSpec,
     activation_shell: &'a str,
-    inject: &'a [InjectSpec],
-    skip_validation: bool,
     reference: &'a str,
     cache_dir: &'a Path,
     client: &'a reqwest_middleware::ClientWithMiddleware,
@@ -220,7 +220,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         options.platforms.clone()
     };
     let lockfile_path = loaded.dir.join("pixi.lock");
-    let locked = load_locked_environments(
+    let mut locked = load_locked_environments(
         &lockfile_path,
         &environment,
         &requested_platforms,
@@ -246,6 +246,34 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     }
     for l in &locked {
         target_platform(l.subdir)?;
+    }
+
+    // Complete the environments: inject local packages, build the source packages that
+    // weren't replaced by one and check that the result is consistent.
+    let source_builds = TempDir::new("pixi-oci-source-builds-")?;
+    let mut source_builder = SourceBuilder::new(&loaded.dir, source_builds.path());
+    for l in &mut locked {
+        let inject: Vec<&Path> = options
+            .inject
+            .iter()
+            .filter(|spec| spec.applies_to(&l.platform, l.subdir))
+            .map(|spec| spec.path.as_path())
+            .collect();
+        inject_packages(&mut l.records, &inject, l.subdir)?;
+        // An injected package replaces a source package of the same name, so it isn't built.
+        l.sources.retain(|source| {
+            !l.records
+                .iter()
+                .any(|r| r.package_record.name == source.name)
+        });
+        if !l.sources.is_empty() {
+            let built = source_builder.build(&l.sources, l.subdir)?;
+            l.records.extend(built);
+        }
+        if !options.skip_validation {
+            validate_environment(&l.records)
+                .with_context(|| format!("invalid environment for {}", l.subdir.as_str()))?;
+        }
     }
     if let BaseSpec::Scratch(scratch) = &base_spec {
         let glibc = scratch
@@ -296,8 +324,6 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         max_layers,
         base_spec: &base_spec,
         activation_shell: &activation_shell,
-        inject: &options.inject,
-        skip_validation: options.skip_validation,
         reference: &reference,
         cache_dir: &cache_dir,
         client: &client,
@@ -413,21 +439,10 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
 /// Install the environment for one platform and write its layers, config and manifest.
 async fn build_platform(
     ctx: &BuildContext<'_>,
-    mut locked: LockedEnvironment,
+    locked: LockedEnvironment,
 ) -> Result<PlatformImage> {
     let subdir = locked.subdir;
     let platform = target_platform(subdir)?;
-    let inject: Vec<&Path> = ctx
-        .inject
-        .iter()
-        .filter(|spec| spec.applies_to(&locked.platform, subdir))
-        .map(|spec| spec.path.as_path())
-        .collect();
-    inject_packages(&mut locked.records, &inject, subdir)?;
-    if !ctx.skip_validation {
-        validate_environment(&locked.records)
-            .with_context(|| format!("invalid environment for {}", subdir.as_str()))?;
-    }
     eprintln!(
         "🔧 Building {} for {} (environment `{}`, {} packages)",
         ctx.reference,
