@@ -6,16 +6,58 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use oci_client::{
     Client, Reference,
-    client::ClientConfig,
+    client::{ClientConfig, ClientProtocol},
     manifest::{ImageIndexEntry, OciDescriptor},
-    secrets::RegistryAuth,
 };
 use oci_spec::image::{
     Arch, Descriptor, DescriptorBuilder, Digest, ImageConfiguration, MediaType, Os,
 };
 use ocidir::{OciDir, OciRead};
 
-use crate::config::SCRATCH;
+use crate::{
+    config::SCRATCH,
+    registry_auth::{AuthSource, CredentialSources, ResolvedAuth},
+};
+
+/// A registry base image and the credentials to pull it with.
+#[derive(Debug)]
+pub struct BaseImageSource {
+    pub reference: Reference,
+    pub auth: ResolvedAuth,
+}
+
+impl BaseImageSource {
+    /// Parse `image` and look up credentials for its registry. Returns `None` for `scratch`.
+    pub fn resolve(image: &str) -> Result<Option<Self>> {
+        if image == SCRATCH {
+            return Ok(None);
+        }
+        let reference: Reference = image
+            .parse()
+            .with_context(|| format!("invalid base image reference `{image}`"))?;
+        let auth = CredentialSources::from_env().resolve(&reference)?;
+        tracing::info!(
+            "pulling {} from {} with {}",
+            reference.repository(),
+            reference.registry(),
+            auth.source
+        );
+        Ok(Some(Self { reference, auth }))
+    }
+}
+
+/// Like docker, talk plain HTTP to registries on the local machine (e.g. `localhost:5000`).
+fn protocol_for(registry: &str) -> ClientProtocol {
+    let host = registry
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(registry, |(host, _)| host);
+    if matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+        ClientProtocol::HttpsExcept(vec![registry.to_string()])
+    } else {
+        ClientProtocol::Https
+    }
+}
 
 /// A base image whose layers are available in the output layout.
 #[derive(Debug)]
@@ -82,22 +124,16 @@ fn to_oci_descriptor(layer: &OciDescriptor) -> Result<Descriptor> {
         .build()?)
 }
 
-/// Pull the manifest, config and layers of `image` for `platform` into `output`.
-/// Returns `None` for `scratch`.
+/// Pull the manifest, config and layers of `source` for `platform` into `output`.
 pub async fn fetch_base_image(
-    image: &str,
+    source: &BaseImageSource,
     platform: &TargetPlatform,
     output: &OciDir,
-) -> Result<Option<BaseImage>> {
-    if image == SCRATCH {
-        return Ok(None);
-    }
-    let reference: Reference = image
-        .parse()
-        .with_context(|| format!("invalid base image reference `{image}`"))?;
-
+) -> Result<BaseImage> {
+    let reference = &source.reference;
     let resolver_platform = platform.clone();
     let client = Client::new(ClientConfig {
+        protocol: protocol_for(reference.resolve_registry()),
         platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
             entries
                 .iter()
@@ -120,11 +156,20 @@ pub async fn fetch_base_image(
             .unwrap_or_default()
     );
     let (manifest, _digest, config_json) = client
-        .pull_manifest_and_config(&reference, &RegistryAuth::Anonymous)
+        .pull_manifest_and_config(reference, &source.auth.auth)
         .await
         .with_context(|| {
+            let hint = match &source.auth.source {
+                AuthSource::Anonymous => format!(
+                    "; for a private image, log in with `docker login` or `podman login`, \
+                     or set {} and {}",
+                    crate::registry_auth::USERNAME_ENV,
+                    crate::registry_auth::PASSWORD_ENV
+                ),
+                other => format!(" with {other}"),
+            };
             format!(
-                "could not pull base image {} for linux/{}",
+                "could not pull base image {} for linux/{}{hint}",
                 reference.whole(),
                 platform.arch
             )
@@ -147,16 +192,16 @@ pub async fn fetch_base_image(
         if output.has_blob(&descriptor)? {
             tracing::debug!("base layer {} already present", layer.digest);
         } else {
-            download_blob(&client, &reference, layer, &descriptor, output).await?;
+            download_blob(&client, reference, layer, &descriptor, output).await?;
         }
         layers.push(descriptor);
     }
 
-    Ok(Some(BaseImage {
-        reference,
+    Ok(BaseImage {
+        reference: reference.clone(),
         layers,
         config,
-    }))
+    })
 }
 
 async fn download_blob(
@@ -213,6 +258,24 @@ mod tests {
             MediaType::ImageLayerZstd
         );
         assert!(layer_media_type("application/vnd.oci.image.config.v1+json").is_err());
+    }
+
+    #[test]
+    fn uses_http_only_for_local_registries() {
+        for local in [
+            "localhost",
+            "localhost:5000",
+            "127.0.0.1:5000",
+            "[::1]:5000",
+        ] {
+            assert_eq!(
+                protocol_for(local),
+                ClientProtocol::HttpsExcept(vec![local.to_string()])
+            );
+        }
+        for remote in ["ghcr.io", "index.docker.io", "localhost.example.com:5000"] {
+            assert_eq!(protocol_for(remote), ClientProtocol::Https);
+        }
     }
 
     #[test]

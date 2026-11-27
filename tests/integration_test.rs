@@ -78,6 +78,8 @@ struct ImageConfig {
 struct InnerConfig {
     #[serde(rename = "Entrypoint")]
     entrypoint: Option<Vec<String>>,
+    #[serde(rename = "Cmd")]
+    cmd: Option<Vec<String>>,
     #[serde(rename = "Env")]
     env: Vec<String>,
 }
@@ -239,6 +241,7 @@ async fn build_example(
     })
     .await
     .expect("build succeeds")
+    .remove(0)
 }
 
 #[rstest]
@@ -506,7 +509,8 @@ async fn injects_local_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
 
     let archive = Archive::open(&out);
     archive.verify_digests();
@@ -557,7 +561,8 @@ async fn builds_multi_platform_index(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     assert_eq!(report.images.len(), 2);
 
     let archive = Archive::open(&out);
@@ -660,7 +665,8 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     let archive = Archive::open(&out);
     let files: HashMap<String, Vec<u8>> = archive.manifest().layers
         [report.images[0].rootfs_layers..][..report.images[0].package_layers]
@@ -749,7 +755,8 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     let files = platform_files(&out, &report);
     for files in &files {
         assert_eq!(
@@ -783,7 +790,8 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     for files in platform_files(&out, &report) {
         assert_eq!(files["opt/env/share/greeter.txt"], b"hello from greeter\n");
         assert!(!files.contains_key("opt/env/share/greeter/greeting.txt"));
@@ -799,15 +807,55 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         ..Default::default()
     })
     .await
-    .expect("build succeeds");
+    .expect("build succeeds")
+    .remove(0);
     for files in platform_files(&out, &report) {
         assert!(!files.keys().any(|f| f.contains("greeter")));
     }
+
+    // Images that need the same source package share one build.
+    let manifest = fs::read_to_string(workspace.join("pixi.toml")).unwrap();
+    fs::write(
+        workspace.join("pixi.toml"),
+        manifest.replace("tag = \"source-build\"\n", "")
+            + "\n[tool.pixi-oci.images.one]\n[tool.pixi-oci.images.two]\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_pixi-oci"))
+        .args(["build", "-p", "linux-64", "--manifest-path"])
+        .arg(&workspace)
+        .current_dir(tmpdir.path())
+        .output()
+        .expect("pixi-oci runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("Building source package greeter").count(),
+        1,
+        "{stderr}"
+    );
+    let metas: Vec<_> = ["one.tar", "two.tar"]
+        .iter()
+        .map(|file| {
+            let archive = Archive::open(&tmpdir.path().join(file));
+            let files: HashMap<String, Vec<u8>> = archive
+                .manifest()
+                .layers
+                .iter()
+                .flat_map(|layer| archive.layer_entries(layer))
+                .map(|(name, _, data)| (name, data))
+                .collect();
+            greeter_meta(&files)
+        })
+        .collect();
+    assert_eq!(metas.len(), 2);
+    assert_eq!(metas[0], metas[1]);
 
     // A source package that fails to build fails the image build.
     fs::write(workspace.join("greeter/recipe.yaml"), "not: a recipe\n").unwrap();
     let err = pixi_oci::build(BuildOptions {
         manifest_path: workspace,
+        images: vec!["one".to_string()],
         platforms: vec!["linux-64".to_string()],
         output: Some(tmpdir.path().join("broken.tar")),
         ..Default::default()
@@ -838,6 +886,115 @@ fn cli_build_is_reproducible(tmpdir: tempfile::TempDir) {
         digests.push(sha256_hex(&fs::read(&out).unwrap()));
     }
     assert_eq!(digests[0], digests[1], "builds must be reproducible");
+}
+
+/// A copy of the example project on a scratch base whose `[tool.pixi-oci]` table is the default
+/// for the given `images` tables instead of an image of its own.
+fn example_with_images(dir: &Path, images: &str) -> PathBuf {
+    let project = example_with_base(dir, "scratch");
+    let manifest = fs::read_to_string(project.join("pixi.toml")).unwrap();
+    let manifest = manifest.replace("tag = \"example-project\"\n", "");
+    fs::write(project.join("pixi.toml"), format!("{manifest}\n{images}")).unwrap();
+    project
+}
+
+#[rstest]
+fn cli_builds_all_images(tmpdir: tempfile::TempDir) {
+    let project = example_with_images(
+        tmpdir.path(),
+        r#"
+[tool.pixi-oci.images.web]
+platform = "linux-64"
+oci-config.cmd = ["--listen", ":80"]
+
+[tool.pixi-oci.images.web-arm]
+tag = "web-arm:1.0"
+platform = "linux-aarch64"
+copy-to-image = []
+"#,
+    );
+    let pixi_oci = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pixi-oci"))
+            .args(["build", "--manifest-path"])
+            .arg(&project)
+            .args(args)
+            .current_dir(tmpdir.path())
+            .output()
+            .expect("pixi-oci runs")
+    };
+
+    let output = pixi_oci(&[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let web = Archive::open(&tmpdir.path().join("web.tar"));
+    let web_arm = Archive::open(&tmpdir.path().join("web-arm.tar"));
+    let index = web.index();
+    assert_eq!(
+        index.manifests[0].annotations["org.opencontainers.image.ref.name"],
+        "web:latest"
+    );
+    let config = web.config();
+    assert_eq!(config.architecture, "amd64");
+    assert_eq!(
+        config.config.cmd,
+        Some(vec!["--listen".to_string(), ":80".to_string()])
+    );
+    // Both inherit the entrypoint; only `web` has the copy layer.
+    let config_arm = web_arm.config();
+    assert_eq!(config_arm.architecture, "arm64");
+    assert_eq!(config_arm.config.entrypoint, config.config.entrypoint);
+    assert_eq!(
+        web_arm.index().manifests[0].annotations["org.opencontainers.image.ref.name"],
+        "web-arm:1.0"
+    );
+    assert_eq!(
+        web.manifest().layers.len(),
+        web_arm.manifest().layers.len() + 1
+    );
+
+    // Selecting one image builds only that one, and allows --output.
+    let out = tmpdir.path().join("selected.tar");
+    let output = pixi_oci(&["web-arm", "--output", out.to_str().unwrap()]);
+    assert!(output.status.success());
+    assert_eq!(Archive::open(&out).config().architecture, "arm64");
+
+    // --output with several images is ambiguous.
+    let output = pixi_oci(&["--output", "x.tar"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--output needs a single image"), "{stderr}");
+
+    let output = pixi_oci(&["nope"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Available images: web, web-arm"),
+        "{stderr}"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn rejects_images_with_the_same_output(tmpdir: tempfile::TempDir) {
+    let project = example_with_images(
+        tmpdir.path(),
+        "[tool.pixi-oci.images.a]\ntag = \"app:a\"\n[tool.pixi-oci.images.b]\ntag = \"app:b\"\n",
+    );
+    let err = pixi_oci::build(BuildOptions {
+        manifest_path: project,
+        platforms: vec!["linux-64".to_string()],
+        ..Default::default()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("images `a` and `b` would both be written to app.tar"),
+        "{err}"
+    );
 }
 
 #[rstest]
@@ -966,4 +1123,212 @@ async fn skopeo_can_inspect(tmpdir: tempfile::TempDir) {
     let json: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(json["Architecture"], "amd64");
     assert_eq!(json["Os"], "linux");
+}
+
+/// A password-protected `registry:2` container, removed on drop.
+struct LocalRegistry {
+    container: String,
+    host: String,
+}
+
+impl LocalRegistry {
+    const USERNAME: &str = "testuser";
+    const PASSWORD: &str = "testpassword";
+    /// `htpasswd -nbB testuser testpassword`
+    const HTPASSWD: &str = "testuser:$2y$05$9pHzQhR.ulyGSFroL43lNeCV3rnEpXDhuOUWppOV4uAS64Mfn2fe2";
+
+    async fn start(dir: &Path) -> Self {
+        let auth_dir = dir.join("registry-auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(auth_dir.join("htpasswd"), format!("{}\n", Self::HTPASSWD)).unwrap();
+        let run = Command::new("docker")
+            .args(["run", "-d", "--rm", "-p", "127.0.0.1::5000", "-v"])
+            .arg(format!("{}:/auth:ro", auth_dir.display()))
+            .args([
+                "-e",
+                "REGISTRY_AUTH=htpasswd",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_REALM=test",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+                "registry:2",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "starting the registry failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let container = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        let port = Command::new("docker")
+            .args(["port", &container, "5000/tcp"])
+            .output()
+            .unwrap();
+        let port = String::from_utf8_lossy(&port.stdout);
+        let port = port
+            .lines()
+            .next()
+            .and_then(|l| l.rsplit_once(':'))
+            .map(|(_, p)| p.trim().to_string())
+            .expect("registry port");
+        let registry = Self {
+            container,
+            host: format!("localhost:{port}"),
+        };
+        // Wait until the registry answers (with 401, as it requires credentials).
+        let client = reqwest::Client::new();
+        for _ in 0..60 {
+            if client
+                .get(format!("http://{}/v2/", registry.host))
+                .send()
+                .await
+                .is_ok_and(|r| r.status() == reqwest::StatusCode::UNAUTHORIZED)
+            {
+                return registry;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("the registry did not come up");
+    }
+
+    /// Push a tiny linux/amd64 image with a single file and return its layer digest.
+    async fn push_base_image(&self, reference: &str) -> String {
+        let mut layer_tar = tar::Builder::new(Vec::new());
+        let content = b"private base\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        layer_tar
+            .append_data(&mut header, "private-base.txt", &content[..])
+            .unwrap();
+        let layer_tar = layer_tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &layer_tar).unwrap();
+        let layer_gz = gz.finish().unwrap();
+        let config = serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", sha256_hex(&layer_tar))]},
+        });
+
+        let client = oci_client::Client::new(oci_client::client::ClientConfig {
+            protocol: oci_client::client::ClientProtocol::Http,
+            ..Default::default()
+        });
+        client
+            .push(
+                &reference.parse().unwrap(),
+                &[oci_client::client::ImageLayer::new(
+                    layer_gz.clone(),
+                    oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(),
+                    None,
+                )],
+                oci_client::client::Config::new(
+                    serde_json::to_vec(&config).unwrap(),
+                    oci_client::manifest::IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                    None,
+                ),
+                &oci_client::secrets::RegistryAuth::Basic(
+                    Self::USERNAME.to_string(),
+                    Self::PASSWORD.to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pushing the base image");
+        format!("sha256:{}", sha256_hex(&layer_gz))
+    }
+}
+
+impl Drop for LocalRegistry {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .output();
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn pulls_private_base_image(tmpdir: tempfile::TempDir) {
+    let docker_running = Command::new("docker")
+        .arg("info")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !docker_running || std::env::var_os("PIXI_OCI_SKIP_DOCKER_TESTS").is_some() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    let registry = LocalRegistry::start(tmpdir.path()).await;
+    let base = format!("{}/private/base:latest", registry.host);
+    let base_layer = registry.push_base_image(&base).await;
+    let project = example_with_base(tmpdir.path(), &base);
+
+    let build = |docker_config: &Path, out: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_pixi-oci"))
+            .args(["build", "--manifest-path"])
+            .arg(&project)
+            .args(["--platform", "linux-64", "--output"])
+            .arg(out)
+            .env("DOCKER_CONFIG", docker_config)
+            .env("XDG_CONFIG_HOME", tmpdir.path())
+            .env_remove("REGISTRY_AUTH_FILE")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("PIXI_OCI_REGISTRY_USERNAME")
+            .env_remove("PIXI_OCI_REGISTRY_PASSWORD")
+            .output()
+            .expect("pixi-oci runs")
+    };
+
+    // Without credentials, the pull is rejected and the error explains how to log in.
+    let anonymous_config = tmpdir.path().join("docker-anonymous");
+    fs::create_dir_all(&anonymous_config).unwrap();
+    let output = build(&anonymous_config, &tmpdir.path().join("anonymous.tar"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("docker login"), "{stderr}");
+
+    // With credentials from the docker config, the base layer ends up in the image.
+    let docker_config = tmpdir.path().join("docker");
+    fs::create_dir_all(&docker_config).unwrap();
+    let auth = format!("{}:{}", LocalRegistry::USERNAME, LocalRegistry::PASSWORD);
+    let auth = base64_encode(auth.as_bytes());
+    fs::write(
+        docker_config.join("config.json"),
+        serde_json::json!({"auths": {registry.host.clone(): {"auth": auth}}}).to_string(),
+    )
+    .unwrap();
+    let out = tmpdir.path().join("private.tar");
+    let output = build(&docker_config, &out);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = Archive::open(&out).manifest();
+    assert_eq!(manifest.layers[0].digest, base_layer);
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

@@ -14,6 +14,7 @@ pub mod inject;
 pub mod install;
 pub mod layers;
 pub mod lockfile;
+pub mod registry_auth;
 pub mod rootfs;
 pub mod source_build;
 
@@ -32,7 +33,7 @@ use crate::{
         DockerManifestEntry, Output, blob_path, prune_blobs, write_docker_manifest,
         write_oci_archive,
     },
-    base_image::{TargetPlatform, fetch_base_image},
+    base_image::{BaseImageSource, TargetPlatform, fetch_base_image},
     cleanup::{PartialFile, TempDir},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
@@ -65,6 +66,8 @@ pub enum OutputFormat {
 pub struct BuildOptions {
     /// `pixi.toml`, `pyproject.toml` or the directory containing it.
     pub manifest_path: PathBuf,
+    /// Images of `[tool.pixi-oci.images]` to build; all of them when empty.
+    pub images: Vec<String>,
     pub environment: Option<String>,
     /// Platforms to build for; more than one builds a multi-platform image.
     pub platforms: Vec<String>,
@@ -86,6 +89,8 @@ pub struct BuildOptions {
 /// Summary of a finished build.
 #[derive(Debug, Clone)]
 pub struct BuildReport {
+    /// The key in `[tool.pixi-oci.images]`, if the manifest names its images.
+    pub name: Option<String>,
     pub output: Option<PathBuf>,
     pub reference: String,
     /// The image index of a multi-platform build.
@@ -148,6 +153,33 @@ fn open_dir(path: &Path) -> Result<cap_std::fs::Dir> {
         .with_context(|| format!("could not open {}", path.display()))
 }
 
+/// An image whose settings and lockfile were resolved and checked, ready to be built.
+struct ImagePlan {
+    /// The key in `[tool.pixi-oci.images]`, if the manifest names its images.
+    name: Option<String>,
+    cfg: config::PixiOciConfig,
+    environment: String,
+    install_prefix: String,
+    max_layers: std::num::NonZeroUsize,
+    base_spec: BaseSpec,
+    /// The registry image to build on, with its credentials, if `base` is one.
+    base_source: Option<BaseImageSource>,
+    activation_shell: String,
+    reference: String,
+    normalized_reference: oci_client::Reference,
+    output_path: PathBuf,
+    locked: Vec<LockedEnvironment>,
+}
+
+/// Settings shared by all images of a build.
+struct SharedContext<'a> {
+    loaded: &'a LoadedManifest,
+    format: OutputFormat,
+    cache_dir: PathBuf,
+    client: reqwest_middleware::ClientWithMiddleware,
+    created: chrono::DateTime<chrono::Utc>,
+}
+
 /// Settings shared by the images of all platforms.
 struct BuildContext<'a> {
     loaded: &'a LoadedManifest,
@@ -156,6 +188,7 @@ struct BuildContext<'a> {
     install_prefix: &'a str,
     max_layers: std::num::NonZeroUsize,
     base_spec: &'a BaseSpec,
+    base_source: Option<&'a BaseImageSource>,
     activation_shell: &'a str,
     reference: &'a str,
     cache_dir: &'a Path,
@@ -170,11 +203,111 @@ struct PlatformImage {
     assembled: AssembledImage,
 }
 
-/// Run a build.
-pub async fn build(options: BuildOptions) -> Result<BuildReport> {
+/// Run a build: one report per image, in the order they were built.
+pub async fn build(options: BuildOptions) -> Result<Vec<BuildReport>> {
     let loaded = LoadedManifest::load(&options.manifest_path)?;
-    let cfg = loaded.config().clone();
+    let images = loaded.config().resolve_images(&options.images)?;
+    if images.len() > 1 {
+        for (flag, set) in [
+            ("--tag", options.tag.is_some()),
+            ("--output", options.output.is_some()),
+            ("--environment", options.environment.is_some()),
+        ] {
+            if set {
+                bail!(
+                    "{flag} needs a single image, but this build has {}; select one with \
+                     `pixi-oci build <IMAGE>`",
+                    images.len()
+                );
+            }
+        }
+    }
 
+    // Check everything that doesn't need the network, for all images, before downloading
+    // anything.
+    let mut plans = images
+        .into_iter()
+        .map(|(name, cfg)| {
+            let label = name.clone();
+            plan_image(&loaded, name, cfg, &options).with_context(|| match label {
+                Some(name) => format!("invalid image `{name}`"),
+                None => "invalid image".to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (i, plan) in plans.iter().enumerate() {
+        let earlier = &plans[..i];
+        if let Some(other) = earlier.iter().find(|p| p.reference == plan.reference) {
+            bail!(
+                "images `{}` and `{}` are both tagged `{}`",
+                other.name.as_deref().unwrap_or_default(),
+                plan.name.as_deref().unwrap_or_default(),
+                plan.reference
+            );
+        }
+        if let Some(other) = earlier.iter().find(|p| p.output_path == plan.output_path) {
+            bail!(
+                "images `{}` and `{}` would both be written to {}; give them different tags",
+                other.name.as_deref().unwrap_or_default(),
+                plan.name.as_deref().unwrap_or_default(),
+                plan.output_path.display()
+            );
+        }
+    }
+    for spec in &options.inject {
+        let platforms = || plans.iter().flat_map(|p| &p.locked);
+        if let Some(platform) = &spec.platform
+            && !platforms().any(|l| spec.applies_to(&l.platform, l.subdir))
+        {
+            let mut names: Vec<&str> = platforms().map(|l| l.platform.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            bail!(
+                "`--inject {platform}:{}` does not match any platform of this build ({})",
+                spec.path.display(),
+                names.join(", ")
+            );
+        }
+    }
+
+    // Complete the environments of all images: inject local packages, build the source
+    // packages that weren't replaced by one and check the result. Images share the builds.
+    let source_builds = TempDir::new("pixi-oci-source-builds-")?;
+    let mut source_builder = SourceBuilder::new(&loaded.dir, source_builds.path());
+    for plan in &mut plans {
+        complete_environments(plan, &options, &mut source_builder).with_context(
+            || match &plan.name {
+                Some(name) => format!("invalid image `{name}`"),
+                None => "invalid image".to_string(),
+            },
+        )?;
+    }
+
+    let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
+    let shared = SharedContext {
+        loaded: &loaded,
+        format: options.format,
+        // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
+        cache_dir: rattler_cache::default_cache_dir()
+            .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?,
+        client: reqwest_client_from_config(&rattler_config)?,
+        created: created_timestamp(),
+    };
+    let mut reports = Vec::with_capacity(plans.len());
+    for plan in plans {
+        reports.push(build_image(&shared, plan).await?);
+    }
+    Ok(reports)
+}
+
+/// Resolve the settings of one image, load its environments from the lockfile and check
+/// them, without touching the network.
+fn plan_image(
+    loaded: &LoadedManifest,
+    name: Option<String>,
+    cfg: config::PixiOciConfig,
+    options: &BuildOptions,
+) -> Result<ImagePlan> {
     let environment = options
         .environment
         .clone()
@@ -195,7 +328,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .clone()
         .unwrap_or_else(|| DEFAULT_ACTIVATION_SHELL.to_string());
 
-    let (name, tag) = options
+    let (image_name, tag) = options
         .tag
         .as_deref()
         .or(cfg.tag.as_deref())
@@ -205,11 +338,22 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             anyhow!("no image name: set `tag` in [tool.pixi-oci] or `--tag name:tag`")
         })?;
     let tag = tag.unwrap_or_else(|| DEFAULT_TAG.to_string());
-    let reference = format!("{name}:{tag}");
+    let reference = format!("{image_name}:{tag}");
     // Fail before downloading and installing anything if the registry would reject the name.
     let normalized_reference: oci_client::Reference = reference
         .parse()
         .map_err(|e| anyhow!("invalid image reference `{reference}`: {e}"))?;
+
+    let output_path = options.output.clone().unwrap_or_else(|| {
+        let file_name = image_name.replace('/', "_");
+        match options.format {
+            OutputFormat::OciTar => PathBuf::from(format!("{file_name}.tar")),
+            OutputFormat::OciDir => PathBuf::from(file_name),
+        }
+    });
+    if options.format == OutputFormat::OciDir && output_path.as_os_str() == "-" {
+        bail!("--format oci-dir cannot write to stdout");
+    }
 
     let requested_platforms = if options.platforms.is_empty() {
         cfg.platform
@@ -219,40 +363,44 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     } else {
         options.platforms.clone()
     };
-    let lockfile_path = loaded.dir.join("pixi.lock");
-    let mut locked = load_locked_environments(
-        &lockfile_path,
+    let locked = load_locked_environments(
+        &loaded.dir.join("pixi.lock"),
         &environment,
         &requested_platforms,
         &options.skip,
     )?;
-    // Check everything that doesn't need the network before downloading anything.
-    for spec in &options.inject {
-        if let Some(platform) = &spec.platform
-            && !locked
-                .iter()
-                .any(|l| spec.applies_to(&l.platform, l.subdir))
-        {
-            bail!(
-                "`--inject {platform}:{}` does not match any platform of this build ({})",
-                spec.path.display(),
-                locked
-                    .iter()
-                    .map(|l| l.platform.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
     for l in &locked {
         target_platform(l.subdir)?;
     }
+    let base_source = match &base_spec {
+        BaseSpec::Image(image) => BaseImageSource::resolve(image)?,
+        BaseSpec::Scratch(_) => None,
+    };
 
-    // Complete the environments: inject local packages, build the source packages that
-    // weren't replaced by one and check that the result is consistent.
-    let source_builds = TempDir::new("pixi-oci-source-builds-")?;
-    let mut source_builder = SourceBuilder::new(&loaded.dir, source_builds.path());
-    for l in &mut locked {
+    Ok(ImagePlan {
+        name,
+        cfg,
+        environment,
+        install_prefix,
+        max_layers,
+        base_spec,
+        base_source,
+        activation_shell,
+        reference,
+        normalized_reference,
+        output_path,
+        locked,
+    })
+}
+
+/// Inject the local packages into the environments of `plan`, build its source packages that
+/// weren't replaced by one, and check that the environments are consistent.
+fn complete_environments(
+    plan: &mut ImagePlan,
+    options: &BuildOptions,
+    source_builder: &mut SourceBuilder,
+) -> Result<()> {
+    for l in &mut plan.locked {
         let inject: Vec<&Path> = options
             .inject
             .iter()
@@ -275,36 +423,41 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
                 .with_context(|| format!("invalid environment for {}", l.subdir.as_str()))?;
         }
     }
-    if let BaseSpec::Scratch(scratch) = &base_spec {
+    if let BaseSpec::Scratch(scratch) = &plan.base_spec {
         let glibc = scratch
             .glibc
             .debian_version()
             .map(upstream_glibc_version)
             .transpose()?;
-        for l in &locked {
+        for l in &plan.locked {
             check_glibc(&l.records, glibc.as_ref())?;
         }
     }
+    Ok(())
+}
 
-    // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
-    let cache_dir = rattler_cache::default_cache_dir()
-        .map_err(|e| anyhow!("could not determine the cache directory: {e}"))?;
+/// Build the images of all platforms of one image and write its layout.
+async fn build_image(shared: &SharedContext<'_>, plan: ImagePlan) -> Result<BuildReport> {
+    let ImagePlan {
+        name,
+        cfg,
+        environment,
+        install_prefix,
+        max_layers,
+        base_spec,
+        base_source,
+        activation_shell,
+        reference,
+        normalized_reference,
+        output_path,
+        locked,
+    } = plan;
 
     // Decide where the layout goes. Base image layers are downloaded straight into it.
-    let default_output = || match options.format {
-        OutputFormat::OciTar => PathBuf::from(format!("{}.tar", name.replace('/', "_"))),
-        OutputFormat::OciDir => PathBuf::from(name.replace('/', "_")),
-    };
-    let output_path = options.output.clone().unwrap_or_else(default_output);
     let to_stdout = output_path.as_os_str() == "-";
     let layout_tmp;
-    let layout_dir: PathBuf = match options.format {
-        OutputFormat::OciDir => {
-            if to_stdout {
-                bail!("--format oci-dir cannot write to stdout");
-            }
-            output_path.clone()
-        }
+    let layout_dir: PathBuf = match shared.format {
+        OutputFormat::OciDir => output_path.clone(),
         OutputFormat::OciTar => {
             layout_tmp = TempDir::new("pixi-oci-layout-")?;
             layout_tmp.path().to_path_buf()
@@ -313,22 +466,20 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
     let output_oci =
         OciDir::ensure(open_dir(&layout_dir)?).context("could not create the output OCI layout")?;
 
-    let rattler_config = load_config(options.rattler_config.as_deref())?.unwrap_or_default();
-    let client = reqwest_client_from_config(&rattler_config)?;
-
     let ctx = BuildContext {
-        loaded: &loaded,
+        loaded: shared.loaded,
         cfg: &cfg,
         environment: &environment,
         install_prefix: &install_prefix,
         max_layers,
         base_spec: &base_spec,
+        base_source: base_source.as_ref(),
         activation_shell: &activation_shell,
         reference: &reference,
-        cache_dir: &cache_dir,
-        client: &client,
+        cache_dir: &shared.cache_dir,
+        client: &shared.client,
         output_oci: &output_oci,
-        created: created_timestamp(),
+        created: shared.created,
     };
     let mut images = Vec::with_capacity(locked.len());
     for locked in locked {
@@ -352,7 +503,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let output = match options.format {
+    let output = match shared.format {
         OutputFormat::OciDir => {
             // index.json only references this build, so blobs of earlier builds are garbage.
             let keep: Vec<&str> = index_digest
@@ -429,6 +580,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         }
     };
     Ok(BuildReport {
+        name,
         output,
         reference,
         index_digest,
@@ -457,10 +609,13 @@ async fn build_platform(
     // assemble the root filesystem for a scratch base.
     let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match ctx.base_spec {
-        BaseSpec::Image(image) => (
-            fetch_base_image(image, &platform, ctx.output_oci).await?,
-            Vec::new(),
-        ),
+        BaseSpec::Image(_) => {
+            let base = match ctx.base_source {
+                Some(source) => Some(fetch_base_image(source, &platform, ctx.output_oci).await?),
+                None => None,
+            };
+            (base, Vec::new())
+        }
         BaseSpec::Scratch(scratch) => (
             None,
             plan_rootfs_layers(scratch, subdir, &client, rootfs_staging.path()).await?,
@@ -532,7 +687,11 @@ async fn build_platform(
         },
     )?);
     let package_layers = layers.len() - rootfs_layer_count;
-    let copy_layer = plan_copy_layer(&ctx.loaded.dir, &ctx.cfg.copy_to_image, &working_dir)?;
+    let copy_layer = plan_copy_layer(
+        &ctx.loaded.dir,
+        ctx.cfg.copy_to_image.as_deref().unwrap_or_default(),
+        &working_dir,
+    )?;
     let has_copy_layer = copy_layer.is_some();
     layers.extend(copy_layer);
 

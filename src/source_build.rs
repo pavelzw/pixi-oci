@@ -19,15 +19,15 @@ fn pixi_executable() -> OsString {
         .unwrap_or_else(|| "pixi".into())
 }
 
-/// Builds the source packages of all platforms of an image.
+/// Builds the source packages of all images and platforms of a build.
 pub struct SourceBuilder {
     /// The directory of the lockfile, which relative source locations are relative to.
     workspace_dir: PathBuf,
     /// Where `pixi build` puts the packages; they have to stay until they are installed.
     output_dir: PathBuf,
-    builds: usize,
-    /// Locations whose packages were all built as noarch, so other platforms reuse them.
-    noarch: Vec<(UrlOrPath, Vec<RepoDataRecord>)>,
+    /// Every build so far: its location, the platform it was built for and its packages.
+    /// Packages that are all noarch serve every platform.
+    builds: Vec<(UrlOrPath, Subdir, Vec<RepoDataRecord>)>,
 }
 
 impl SourceBuilder {
@@ -35,15 +35,14 @@ impl SourceBuilder {
         Self {
             workspace_dir: workspace_dir.to_path_buf(),
             output_dir: output_dir.to_path_buf(),
-            builds: 0,
-            noarch: Vec::new(),
+            builds: Vec::new(),
         }
     }
 
     /// Build the `sources` for `subdir` and return a record for each of them.
     ///
-    /// Every location is built once, even if it provides several of the packages. Noarch
-    /// packages are only built for the first platform.
+    /// Every location is built once per platform, even if it provides several of the
+    /// packages or several images need it. Noarch packages are only built once.
     pub fn build(
         &mut self,
         sources: &[SourcePackage],
@@ -59,25 +58,29 @@ impl SourceBuilder {
 
         let mut records = Vec::with_capacity(sources.len());
         for (location, packages) in locations {
-            if let Some((_, built)) = self.noarch.iter().find(|(l, _)| l == location) {
-                records.extend(select_packages(built, &packages, location, subdir)?);
-                continue;
-            }
-            let built = self.build_location(location, &packages, subdir)?;
-            records.extend(select_packages(&built, &packages, location, subdir)?);
-            if built
-                .iter()
-                .all(|r| r.package_record.subdir == Subdir::NoArch.as_str())
-            {
-                self.noarch.push((location.clone(), built));
-            }
+            let earlier = self.builds.iter().find(|(l, s, built)| {
+                l == location
+                    && (*s == subdir
+                        || built
+                            .iter()
+                            .all(|r| r.package_record.subdir == Subdir::NoArch.as_str()))
+            });
+            let built = match earlier {
+                Some((_, _, built)) => built,
+                None => {
+                    let built = self.build_location(location, &packages, subdir)?;
+                    self.builds.push((location.clone(), subdir, built));
+                    &self.builds.last().expect("just pushed").2
+                }
+            };
+            records.extend(select_packages(built, &packages, location, subdir)?);
         }
         Ok(records)
     }
 
     /// Run `pixi build` for the package at `location` and return all packages it produced.
     fn build_location(
-        &mut self,
+        &self,
         location: &UrlOrPath,
         packages: &[&SourcePackage],
         subdir: Subdir,
@@ -92,8 +95,7 @@ impl SourceBuilder {
                 packages[0].name.as_source()
             ),
         };
-        let output = self.output_dir.join(self.builds.to_string());
-        self.builds += 1;
+        let output = self.output_dir.join(self.builds.len().to_string());
         std::fs::create_dir_all(&output)
             .with_context(|| format!("could not create {}", output.display()))?;
 

@@ -20,6 +20,7 @@ pixi-oci build -p linux-64 -p linux-aarch64
 pixi-oci build --format oci-dir -o ./myapp
 pixi-oci build --inject dist/myapp-1.0.0-pyh4616a5c_0.conda
 pixi-oci build --skip libfoo
+pixi-oci build server worker   # only these of [tool.pixi-oci.images]
 ```
 
 The tarball is an OCI image layout that also carries a docker-archive `manifest.json`, so every common tool accepts it:
@@ -79,6 +80,7 @@ stop-signal = "SIGTERM"
 | `max-layers`       | Upper bound for the number of layers used by the conda packages.                                                                                                               |
 | `copy-to-image`    | Files or directories to copy into the image, relative to the manifest. Plain strings land in the working directory under their own name, like `COPY` in a Dockerfile.          |
 | `activation-shell` | Interpreter for the activation wrapper (only used when the environment has `activate.d` scripts).                                                                              |
+| `images.<name>`    | Named images, each a table with the keys above. See [Multiple images](#multiple-images).                                                                                       |
 | `oci-config.*`     | Image config fields, named after the docker image spec in kebab-case (`entrypoint`, `cmd`, `env`, `working-dir`, `user`, `labels`, `exposed-ports`, `volumes`, `stop-signal`). |
 
 ### Base
@@ -86,7 +88,7 @@ stop-signal = "SIGTERM"
 `base` is either a registry reference or a table describing a root filesystem built from scratch:
 
 ```toml
-# a public registry image, pulled anonymously
+# a registry image
 base = "ubuntu:latest"
 
 # from scratch, with glibc and a shadow setup (the default, same as `base = {}`)
@@ -101,6 +103,16 @@ base = { shadow-setup = false, glibc = false }
 
 - `glibc` adds Debian's `libc6` package, downloaded from [snapshot.debian.org](https://snapshot.debian.org/binary/libc6/) and verified against the archive's checksum. `true` means `2.41-12+deb13u4` (Debian 13); a string is any Debian `libc6` version. The layer has the libraries, the dynamic loader reachable as `/lib64/ld-linux-x86-64.so.2` (or the platform's equivalent) and `/etc/nsswitch.conf`.
 - `shadow-setup` adds `/etc/passwd`, `/etc/group`, `/etc/shadow` and `/etc/gshadow` with `root` and `nobody`, plus `/root` and a world-writable `/tmp`, like [`shadowSetup`](https://nixos.org/manual/nixpkgs/stable/#ssec-pkgs-dockerTools-shadowSetup) in nixpkgs.
+
+#### Private base images
+
+Registry images are pulled with the first credentials found for their registry:
+
+1. `PIXI_OCI_REGISTRY_USERNAME` and `PIXI_OCI_REGISTRY_PASSWORD`
+2. the auth files of podman and skopeo: `$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json` and `$XDG_CONFIG_HOME/containers/auth.json` (default `~/.config/containers/auth.json`)
+3. the docker config, `$DOCKER_CONFIG/config.json` (default `~/.docker/config.json`), including credential helpers (`credsStore`, `credHelpers`)
+
+Without credentials, the image is pulled anonymously. So `docker login`, `podman login` or [`docker/login-action`](https://github.com/docker/login-action) in GitHub Actions are enough. Identity tokens (e.g. from `az acr login`) are not supported; use a username and password instead. Registries on `localhost` or `127.0.0.1` are accessed over plain HTTP, like docker does.
 
 Builds of `pixi-oci` with the `bundled-glibc` cargo feature embed the default `libc6` packages for `amd64` and `arm64`, so they are not downloaded at runtime. Other versions and architectures are still downloaded.
 
@@ -125,7 +137,7 @@ platforms = ["linux-64", "linux-aarch64"]
 myapp = { path = "." }
 ```
 
-Each source location is built once per platform, and a noarch build is reused for all platforms. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`: an injected package replaces the source package of the same name, which is then not built. `--skip` leaves a source package out entirely.
+Each source location is built once per platform, even when several images use it, and a noarch build serves all platforms. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`: an injected package replaces the source package of the same name, which is then not built. `--skip` leaves a source package out entirely.
 
 Compiled packages are cross-compiled for the target platform, which `pixi build` does not support on every host for every backend. If building for a linux platform fails on your machine, build on a linux host of that architecture, or build the package there and pass it with `--inject`.
 
@@ -184,3 +196,35 @@ pixi run test
 pixi run pre-commit-run
 pixi run example
 ```
+
+### Multiple images
+
+To build several images from one manifest, for example from different environments, describe each in `[tool.pixi-oci.images.<name>]`. The top-level `[tool.pixi-oci]` table then holds the defaults shared by all images instead of being an image of its own:
+
+```toml
+[tool.pixi-oci]
+base = { glibc = true }
+platform = ["linux-64", "linux-aarch64"]
+oci-config.labels = { "org.opencontainers.image.source" = "https://github.com/you/example" }
+
+[tool.pixi-oci.images.server]
+environment = "prod"
+tag = "ghcr.io/you/server"
+oci-config.entrypoint = "server --port 8080"
+
+[tool.pixi-oci.images.worker]
+environment = "worker"
+platform = "linux-64"
+oci-config.entrypoint = "worker"
+```
+
+```shell
+pixi-oci build                 # all images: ghcr.io_you_server.tar and worker.tar
+pixi-oci build worker          # only worker
+pixi-oci build server -o server.tar
+```
+
+- An image takes every key it doesn't set from the top-level table. `oci-config.labels` and `oci-config.env` are merged key by key, and an image that sets `oci-config.entrypoint` doesn't inherit `oci-config.cmd`, like in a Dockerfile.
+- An image without a `tag` is tagged with its name, so `worker` above becomes `worker:latest`.
+- Each image is written to its own `<name>.tar` (or `<name>/` with `--format oci-dir`), named after its tag. `--tag`, `--output` and `--environment` need a single selected image; `--platform`, `--inject` and `--skip` apply to every image.
+- All images are checked against the lockfile before anything is downloaded.

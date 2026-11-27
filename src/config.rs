@@ -53,13 +53,89 @@ pub struct PixiOciConfig {
     /// Maximum number of layers used for the conda packages.
     pub max_layers: Option<NonZeroUsize>,
     /// Additional files to copy into the image.
-    #[serde(default)]
-    pub copy_to_image: Vec<CopyEntry>,
+    pub copy_to_image: Option<Vec<CopyEntry>>,
     /// Interpreter for the activation wrapper script.
     pub activation_shell: Option<String>,
     /// Image config fields (docker image spec `config`).
     #[serde(default)]
     pub oci_config: OciConfigSection,
+    /// Named images, each built with the settings above as defaults.
+    #[serde(default)]
+    pub images: BTreeMap<String, PixiOciConfig>,
+}
+
+impl PixiOciConfig {
+    /// The images to build, by name, with their settings merged onto the top-level defaults.
+    ///
+    /// Without `[tool.pixi-oci.images]`, the top-level section is the only image and has no
+    /// name. Otherwise `selected` picks images by name, and all of them are built when it is
+    /// empty. An image without a `tag` is tagged with its name.
+    pub fn resolve_images(
+        &self,
+        selected: &[String],
+    ) -> Result<Vec<(Option<String>, PixiOciConfig)>> {
+        if self.images.is_empty() {
+            if let Some(name) = selected.first() {
+                bail!("cannot select image `{name}`: there is no [tool.pixi-oci.images] table");
+            }
+            return Ok(vec![(None, self.clone())]);
+        }
+        if let Some((name, _)) = self.images.iter().find(|(_, i)| !i.images.is_empty()) {
+            bail!("image `{name}` cannot define images of its own");
+        }
+        let mut names: Vec<&String> = Vec::new();
+        if selected.is_empty() {
+            names.extend(self.images.keys());
+        }
+        for name in selected {
+            if !self.images.contains_key(name) {
+                bail!(
+                    "unknown image `{name}`. Available images: {}",
+                    self.images.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let mut cfg = self.images[name].merged_onto(self)?;
+                cfg.tag.get_or_insert_with(|| name.clone());
+                Ok((Some(name.clone()), cfg))
+            })
+            .collect()
+    }
+
+    /// Fill the fields that are unset in `self` from `defaults`. See
+    /// [`OciConfigSection::merged_onto`] for `oci-config`.
+    fn merged_onto(&self, defaults: &PixiOciConfig) -> Result<PixiOciConfig> {
+        Ok(PixiOciConfig {
+            base: self.base.clone().or_else(|| defaults.base.clone()),
+            environment: self
+                .environment
+                .clone()
+                .or_else(|| defaults.environment.clone()),
+            platform: self.platform.clone().or_else(|| defaults.platform.clone()),
+            install_prefix: self
+                .install_prefix
+                .clone()
+                .or_else(|| defaults.install_prefix.clone()),
+            tag: self.tag.clone().or_else(|| defaults.tag.clone()),
+            max_layers: self.max_layers.or(defaults.max_layers),
+            copy_to_image: self
+                .copy_to_image
+                .clone()
+                .or_else(|| defaults.copy_to_image.clone()),
+            activation_shell: self
+                .activation_shell
+                .clone()
+                .or_else(|| defaults.activation_shell.clone()),
+            oci_config: self.oci_config.merged_onto(&defaults.oci_config)?,
+            images: BTreeMap::new(),
+        })
+    }
 }
 
 /// `platform`: a single platform or a list of platforms for a multi-platform image.
@@ -225,14 +301,62 @@ pub struct OciConfigSection {
     pub user: Option<String>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    #[serde(default)]
-    pub exposed_ports: Vec<PortSpec>,
-    #[serde(default)]
-    pub volumes: Vec<String>,
+    pub exposed_ports: Option<Vec<PortSpec>>,
+    pub volumes: Option<Vec<String>>,
     pub stop_signal: Option<String>,
 }
 
 impl OciConfigSection {
+    /// Fill the fields that are unset in `self` from `defaults`. `labels` and `env` are merged
+    /// key by key; like in a Dockerfile, setting an entrypoint drops an inherited `cmd`.
+    fn merged_onto(&self, defaults: &OciConfigSection) -> Result<OciConfigSection> {
+        let mut labels = defaults.labels.clone();
+        labels.extend(self.labels.clone());
+        let env = match (&defaults.env, &self.env) {
+            (Some(defaults), Some(own)) => {
+                let mut pairs = defaults.to_pairs()?;
+                for (key, value) in own.to_pairs()? {
+                    match pairs.iter_mut().find(|(k, _)| *k == key) {
+                        Some(pair) => pair.1 = value,
+                        None => pairs.push((key, value)),
+                    }
+                }
+                Some(EnvSpec::List(
+                    pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+                ))
+            }
+            (defaults, own) => own.clone().or_else(|| defaults.clone()),
+        };
+        let cmd = match (&self.cmd, &self.entrypoint) {
+            (Some(cmd), _) => Some(cmd.clone()),
+            (None, Some(_)) => None,
+            (None, None) => defaults.cmd.clone(),
+        };
+        Ok(OciConfigSection {
+            entrypoint: self
+                .entrypoint
+                .clone()
+                .or_else(|| defaults.entrypoint.clone()),
+            cmd,
+            env,
+            working_dir: self
+                .working_dir
+                .clone()
+                .or_else(|| defaults.working_dir.clone()),
+            user: self.user.clone().or_else(|| defaults.user.clone()),
+            labels,
+            exposed_ports: self
+                .exposed_ports
+                .clone()
+                .or_else(|| defaults.exposed_ports.clone()),
+            volumes: self.volumes.clone().or_else(|| defaults.volumes.clone()),
+            stop_signal: self
+                .stop_signal
+                .clone()
+                .or_else(|| defaults.stop_signal.clone()),
+        })
+    }
+
     /// Convert into an OCI image [`Config`]. Unset fields stay `None` so they can be inherited
     /// from the base image (see [`crate::image::merge_config`]).
     pub fn to_oci_config(&self) -> Result<Config> {
@@ -263,15 +387,17 @@ impl OciConfigSection {
                 .filter(|l| !l.is_empty()),
         );
         config.set_exposed_ports(
-            Some(
-                self.exposed_ports
-                    .iter()
-                    .map(PortSpec::to_port_string)
-                    .collect::<Vec<_>>(),
-            )
-            .filter(|p| !p.is_empty()),
+            self.exposed_ports
+                .as_ref()
+                .map(|ports| {
+                    ports
+                        .iter()
+                        .map(PortSpec::to_port_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|p| !p.is_empty()),
         );
-        config.set_volumes(Some(self.volumes.clone()).filter(|v| !v.is_empty()));
+        config.set_volumes(self.volumes.clone().filter(|v| !v.is_empty()));
         config.set_stop_signal(self.stop_signal.clone());
         Ok(config)
     }
@@ -407,7 +533,7 @@ mod tests {
             }))
         );
         assert_eq!(cfg.max_layers, NonZeroUsize::new(20));
-        assert_eq!(cfg.copy_to_image.len(), 2);
+        assert_eq!(cfg.copy_to_image.unwrap().len(), 2);
         assert_eq!(
             cfg.oci_config.entrypoint.unwrap().to_argv().unwrap(),
             vec!["caddy", "file-server", "--browse", "--root", "."]
@@ -441,6 +567,7 @@ exposed-ports = [8080, "9090", "53/udp"]
         );
         let ports: Vec<_> = cfg
             .exposed_ports
+            .unwrap()
             .iter()
             .map(PortSpec::to_port_string)
             .collect();
@@ -478,6 +605,23 @@ exposed-ports = [8080]
         );
         assert!(config.labels().is_none());
         assert!(config.volumes().is_none());
+    }
+
+    #[test]
+    fn empty_lists_leave_config_fields_unset() {
+        let config = |toml: &str| {
+            parse(toml)
+                .tool
+                .pixi_oci
+                .oci_config
+                .to_oci_config()
+                .unwrap()
+        };
+        let set = config("[tool.pixi-oci.oci-config]\nvolumes = [\"/data\"]\n");
+        assert_eq!(set.volumes().as_deref(), Some(&["/data".to_string()][..]));
+        let empty = config("[tool.pixi-oci.oci-config]\nvolumes = []\nexposed-ports = []\n");
+        assert!(empty.volumes().is_none());
+        assert!(empty.exposed_ports().is_none());
     }
 
     #[test]
@@ -554,6 +698,102 @@ exposed-ports = [8080]
             destination: Some("sub/renamed".into()),
         };
         assert_eq!(e.destination("/app").unwrap(), "/app/sub/renamed");
+    }
+
+    const MULTI_IMAGE: &str = r#"
+[tool.pixi-oci]
+environment = "prod"
+platform = ["linux-64", "linux-aarch64"]
+copy-to-image = ["a"]
+
+[tool.pixi-oci.oci-config]
+cmd = ["--help"]
+env = { A = "1", B = "2" }
+labels = { source = "repo", team = "x" }
+exposed-ports = [80]
+
+[tool.pixi-oci.images.server]
+tag = "ghcr.io/you/server:1.0"
+copy-to-image = []
+oci-config.env = ["B=3", "C=4"]
+oci-config.labels = { team = "y" }
+
+[tool.pixi-oci.images.worker]
+environment = "worker"
+platform = "linux-64"
+oci-config.entrypoint = "worker"
+oci-config.exposed-ports = []
+"#;
+
+    #[test]
+    fn single_image_without_images_table() {
+        let cfg = parse("[tool.pixi-oci]\ntag = \"foo\"\n").tool.pixi_oci;
+        let images = cfg.resolve_images(&[]).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, None);
+        assert_eq!(images[0].1.tag.as_deref(), Some("foo"));
+        let err = cfg.resolve_images(&["foo".into()]).unwrap_err().to_string();
+        assert!(err.contains("no [tool.pixi-oci.images]"), "{err}");
+    }
+
+    #[test]
+    fn images_inherit_the_top_level_settings() {
+        let cfg = parse(MULTI_IMAGE).tool.pixi_oci;
+        let images = cfg.resolve_images(&[]).unwrap();
+        let names: Vec<_> = images.iter().map(|(n, _)| n.as_deref().unwrap()).collect();
+        assert_eq!(names, ["server", "worker"]);
+
+        let server = &images[0].1;
+        assert_eq!(server.tag.as_deref(), Some("ghcr.io/you/server:1.0"));
+        assert_eq!(server.environment.as_deref(), Some("prod"));
+        assert_eq!(
+            server.platform.as_ref().unwrap().to_vec(),
+            ["linux-64", "linux-aarch64"]
+        );
+        assert_eq!(server.copy_to_image, Some(vec![]));
+        let oci = &server.oci_config;
+        assert_eq!(
+            oci.env.as_ref().unwrap().to_pairs().unwrap(),
+            [("A", "1"), ("B", "3"), ("C", "4")].map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(oci.labels["source"], "repo");
+        assert_eq!(oci.labels["team"], "y");
+        assert_eq!(oci.cmd.as_ref().unwrap().to_argv().unwrap(), ["--help"]);
+        assert_eq!(oci.exposed_ports.as_ref().unwrap().len(), 1);
+        assert!(server.images.is_empty());
+
+        let worker = &images[1].1;
+        assert_eq!(worker.tag.as_deref(), Some("worker"));
+        assert_eq!(worker.environment.as_deref(), Some("worker"));
+        assert_eq!(worker.platform.as_ref().unwrap().to_vec(), ["linux-64"]);
+        assert_eq!(worker.copy_to_image.as_ref().unwrap().len(), 1);
+        // Setting an entrypoint drops the inherited cmd.
+        assert!(worker.oci_config.cmd.is_none());
+        assert_eq!(worker.oci_config.exposed_ports, Some(vec![]));
+    }
+
+    #[test]
+    fn selects_images_by_name() {
+        let cfg = parse(MULTI_IMAGE).tool.pixi_oci;
+        let selected = cfg
+            .resolve_images(&["worker".into(), "server".into(), "worker".into()])
+            .unwrap();
+        let names: Vec<_> = selected
+            .iter()
+            .map(|(n, _)| n.as_deref().unwrap())
+            .collect();
+        assert_eq!(names, ["worker", "server"]);
+        let err = cfg
+            .resolve_images(&["nope".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Available images: server, worker"), "{err}");
+    }
+
+    #[test]
+    fn rejects_nested_images() {
+        let cfg = parse("[tool.pixi-oci.images.a.images.b]\n").tool.pixi_oci;
+        assert!(cfg.resolve_images(&[]).is_err());
     }
 
     #[test]
