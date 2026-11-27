@@ -14,6 +14,7 @@ pub mod inject;
 pub mod install;
 pub mod layers;
 pub mod lockfile;
+pub mod registry_auth;
 pub mod rootfs;
 
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use crate::{
         DockerManifestEntry, Output, blob_path, prune_blobs, write_docker_manifest,
         write_oci_archive,
     },
-    base_image::{TargetPlatform, fetch_base_image},
+    base_image::{BaseImageSource, TargetPlatform, fetch_base_image},
     cleanup::{PartialFile, TempDir},
     config::{
         BaseSpec, DEFAULT_ACTIVATION_SHELL, DEFAULT_INSTALL_PREFIX, DEFAULT_MAX_LAYERS,
@@ -154,6 +155,7 @@ struct BuildContext<'a> {
     install_prefix: &'a str,
     max_layers: std::num::NonZeroUsize,
     base_spec: &'a BaseSpec,
+    base_source: Option<&'a BaseImageSource>,
     activation_shell: &'a str,
     inject: &'a [InjectSpec],
     skip_validation: bool,
@@ -257,6 +259,10 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
             check_glibc(&l.records, glibc.as_ref())?;
         }
     }
+    let base_source = match &base_spec {
+        BaseSpec::Image(image) => BaseImageSource::resolve(image)?,
+        BaseSpec::Scratch(_) => None,
+    };
 
     // The conda package cache, shared with pixi. Override with `RATTLER_CACHE_DIR`.
     let cache_dir = rattler_cache::default_cache_dir()
@@ -295,6 +301,7 @@ pub async fn build(options: BuildOptions) -> Result<BuildReport> {
         install_prefix: &install_prefix,
         max_layers,
         base_spec: &base_spec,
+        base_source: base_source.as_ref(),
         activation_shell: &activation_shell,
         inject: &options.inject,
         skip_validation: options.skip_validation,
@@ -442,10 +449,13 @@ async fn build_platform(
     // assemble the root filesystem for a scratch base.
     let rootfs_staging = TempDir::new("pixi-oci-rootfs-")?;
     let (base, rootfs_layers) = match ctx.base_spec {
-        BaseSpec::Image(image) => (
-            fetch_base_image(image, &platform, ctx.output_oci).await?,
-            Vec::new(),
-        ),
+        BaseSpec::Image(_) => {
+            let base = match ctx.base_source {
+                Some(source) => Some(fetch_base_image(source, &platform, ctx.output_oci).await?),
+                None => None,
+            };
+            (base, Vec::new())
+        }
         BaseSpec::Scratch(scratch) => (
             None,
             plan_rootfs_layers(scratch, subdir, &client, rootfs_staging.path()).await?,
