@@ -31,7 +31,6 @@ pub struct SourceBuilder {
     workspace_dir: PathBuf,
     /// Where `pixi publish` puts the packages; they have to stay until they are installed.
     output_dir: PathBuf,
-    builds: usize,
     /// Every package built so far, with the platform it was built for. A noarch package
     /// serves every platform.
     built: Vec<(Subdir, RepoDataRecord)>,
@@ -42,7 +41,6 @@ impl SourceBuilder {
         Self {
             workspace_dir: workspace_dir.to_path_buf(),
             output_dir: output_dir.to_path_buf(),
-            builds: 0,
             built: Vec::new(),
         }
     }
@@ -115,31 +113,29 @@ impl SourceBuilder {
                 manifests.push(manifest);
             }
         }
-        let output = self.output_dir.join(self.builds.to_string());
-        self.builds += 1;
-        std::fs::create_dir_all(&output)
-            .with_context(|| format!("could not create {}", output.display()))?;
+        // A directory per publish, so every build only finds its own packages. It is removed
+        // with `output_dir`.
+        let output = tempfile::Builder::new()
+            .prefix("publish-")
+            .tempdir_in(&self.output_dir)
+            .with_context(|| {
+                format!(
+                    "could not create a directory in {}",
+                    self.output_dir.display()
+                )
+            })?
+            .keep();
 
         let names = sources
             .iter()
             .map(|p| p.name.as_source())
             .collect::<Vec<_>>()
             .join(", ");
-        // Noarch packages are the same for every platform, so build them for the host: their
-        // build and host environments then run here, without cross-compiling.
-        let build_subdir = match Subdir::current() {
-            Some(current) if sources.iter().all(|s| s.noarch) => {
-                eprintln!("🏗️  Building {names} (noarch) with pixi publish");
-                current
-            }
-            _ => {
-                eprintln!(
-                    "🏗️  Building {names} for {} with pixi publish",
-                    subdir.as_str()
-                );
-                subdir
-            }
-        };
+        let build_subdir = build_platform(sources, subdir, Subdir::current());
+        eprintln!(
+            "🏗️  Building {names} with pixi publish --target-platform {}",
+            build_subdir.as_str()
+        );
         run_pixi_publish(&manifests, build_subdir, &output)
             .with_context(|| format!("could not build source packages {names}"))?;
         let built = built_records(&output)?;
@@ -147,6 +143,16 @@ impl SourceBuilder {
             eprintln!("📦 Built {}", record.identifier);
         }
         Ok(built)
+    }
+}
+
+/// The platform to build `sources` for, when they go into an image for `target` and pixi-oci
+/// runs on `host`. Noarch packages are the same for every platform, so they are built for the
+/// host: their build and host environments then run here, without cross-compiling.
+fn build_platform(sources: &[SourcePackage], target: Subdir, host: Option<Subdir>) -> Subdir {
+    match host {
+        Some(host) if sources.iter().all(|s| s.noarch) => host,
+        _ => target,
     }
 }
 
@@ -379,6 +385,30 @@ mod tests {
         let variants = [record("native", "linux-64"), record("native", "noarch")];
         let err = select_package(&variants, &source("native"), Subdir::Linux64).unwrap_err();
         assert!(err.to_string().contains("several variants"), "{err}");
+    }
+
+    #[test]
+    fn builds_noarch_packages_for_the_host() {
+        let source = |noarch| SourcePackage {
+            name: "myapp".parse().unwrap(),
+            location: UrlOrPath::Path("myapp".into()),
+            noarch,
+        };
+        let host = Some(Subdir::OsxArm64);
+        let noarch = [source(true), source(true)];
+        let mixed = [source(true), source(false)];
+        assert_eq!(
+            build_platform(&noarch, Subdir::Linux64, host),
+            Subdir::OsxArm64
+        );
+        assert_eq!(
+            build_platform(&mixed, Subdir::Linux64, host),
+            Subdir::Linux64
+        );
+        assert_eq!(
+            build_platform(&noarch, Subdir::Linux64, None),
+            Subdir::Linux64
+        );
     }
 
     #[test]
