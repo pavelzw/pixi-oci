@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rattler_conda_types::{PackageName, RepoDataRecord, Subdir};
-use rattler_lock::{CondaPackageData, LockFile, LockedPackage, UrlOrPath};
+use rattler_lock::{CondaPackageData, LockFile, LockedPackage, UrlOrPath, VariantValue};
 
 /// The conda packages locked for one environment on one platform.
 #[derive(Debug)]
@@ -25,6 +25,8 @@ pub struct SourcePackage {
     pub name: PackageName,
     /// Where the package manifest lives; a relative path is relative to the lockfile.
     pub location: UrlOrPath,
+    /// Whether the lockfile says the package is built as noarch.
+    pub noarch: bool,
 }
 
 /// Load the lockfile and resolve the requested environment and platforms, one
@@ -132,6 +134,10 @@ fn locked_environment(
                 sources.push(SourcePackage {
                     name: source.name().clone(),
                     location: source.location.clone(),
+                    noarch: matches!(
+                        source.variants.get("target_platform"),
+                        Some(VariantValue::String(platform)) if platform == "noarch"
+                    ),
                 });
                 None
             }
@@ -301,6 +307,7 @@ packages:
             [SourcePackage {
                 name: "myapp".parse().unwrap(),
                 location: UrlOrPath::Path(".".into()),
+                noarch: true,
             }]
         );
     }

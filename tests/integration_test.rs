@@ -706,14 +706,18 @@ async fn skips_locked_packages(tmpdir: tempfile::TempDir) {
 fn source_build_workspace(dir: &Path) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/source-build");
     let workspace = dir.join("source-build");
-    fs::create_dir_all(workspace.join("greeter")).unwrap();
     for file in [
         "pixi.toml",
         "pixi.lock",
         "greeter/pixi.toml",
         "greeter/recipe.yaml",
+        "app/pixi.toml",
+        "app/pyproject.toml",
+        "app/src/app/__init__.py",
     ] {
-        fs::copy(source.join(file), workspace.join(file)).unwrap();
+        let target = workspace.join(file);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(source.join(file), target).unwrap();
     }
     workspace
 }
@@ -758,7 +762,15 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
     .expect("build succeeds")
     .remove(0);
     let files = platform_files(&out, &report);
+    let has_app = |files: &HashMap<String, Vec<u8>>| {
+        files
+            .keys()
+            .any(|f| f.ends_with("/site-packages/app/__init__.py"))
+    };
     for files in &files {
+        // `app` depends on the source package `greeter` at runtime, which `pixi publish`
+        // only accepts when both are built together.
+        assert!(has_app(files));
         assert_eq!(
             files["opt/env/share/greeter/greeting.txt"],
             b"hello from greeter\n"
@@ -769,7 +781,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
                 .any(|f| f.starts_with("opt/env/share/zoneinfo/"))
         );
     }
-    // The noarch package is built once and installed on both platforms.
+    // The noarch packages are built once and installed on both platforms.
     let greeter_meta = |files: &HashMap<String, Vec<u8>>| {
         files
             .iter()
@@ -779,7 +791,8 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
     };
     assert_eq!(greeter_meta(&files[0]), greeter_meta(&files[1]));
 
-    // An injected package of the same name replaces the source package, which isn't built.
+    // An injected package of the same name replaces the source package. It is still built
+    // with `app`, which depends on it, but the injected package is installed.
     let greeter = write_conda_package(tmpdir.path(), "greeter", &[]);
     let out = tmpdir.path().join("injected.tar");
     let report = pixi_oci::build(BuildOptions {
@@ -793,6 +806,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
     .expect("build succeeds")
     .remove(0);
     for files in platform_files(&out, &report) {
+        assert!(has_app(&files));
         assert_eq!(files["opt/env/share/greeter.txt"], b"hello from greeter\n");
         assert!(!files.contains_key("opt/env/share/greeter/greeting.txt"));
     }
@@ -803,14 +817,15 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         manifest_path: workspace.clone(),
         platforms,
         output: Some(out.clone()),
-        skip: vec!["greeter".parse().unwrap()],
+        skip: vec!["app".parse().unwrap()],
         ..Default::default()
     })
     .await
     .expect("build succeeds")
     .remove(0);
     for files in platform_files(&out, &report) {
-        assert!(!files.keys().any(|f| f.contains("greeter")));
+        assert!(!has_app(&files));
+        assert!(files.contains_key("opt/env/share/greeter/greeting.txt"));
     }
 
     // Images that need the same source package share one build.
@@ -829,7 +844,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
         .expect("pixi-oci runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert_eq!(stderr.matches("Building greeter").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("with pixi publish").count(), 1, "{stderr}");
     let metas: Vec<_> = ["one.tar", "two.tar"]
         .iter()
         .map(|file| {
@@ -859,7 +874,7 @@ async fn builds_source_packages(tmpdir: tempfile::TempDir) {
     .await
     .unwrap_err();
     assert!(
-        format!("{err:#}").contains("could not build source packages greeter"),
+        format!("{err:#}").contains("could not build source packages"),
         "{err:#}"
     );
 }

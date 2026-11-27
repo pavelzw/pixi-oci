@@ -67,8 +67,8 @@ struct BuildArgs {
     config: Option<PathBuf>,
 
     /// Inject an additional local conda package (`.conda` or `.tar.bz2`) into the environment.
-    /// Replaces a locked package of the same name; a replaced source package is not built.
-    /// Prefix with `PLATFORM:` to inject it only for that platform. Can be given multiple times.
+    /// Replaces a locked package of the same name, binary or source. Prefix with `PLATFORM:` to
+    /// inject it only for that platform. Can be given multiple times.
     #[arg(short, long, value_name = "[PLATFORM:]PATH")]
     inject: Vec<InjectSpec>,
 

@@ -1,12 +1,15 @@
-# A workspace with a pixi-build source package, built by `pixi-oci build` with `pixi publish`.
+# A workspace with pixi-build source packages, built by `pixi-oci build` with `pixi publish`.
 [workspace]
 channels = ["conda-forge"]
 name = "source-build"
 platforms = ["linux-64", "linux-aarch64"]
 preview = ["pixi-build"]
 
-[dependencies]
+[workspace.dependencies]
 greeter = { path = "greeter" }
+
+[dependencies]
+app = { path = "app" }
 
 [tool.pixi-oci]
 tag = "source-build"

@@ -1,0 +1,14 @@
+# A noarch python package with a source run dependency: `pixi publish --path app` alone
+# refuses it, so pixi-oci publishes all source packages of a platform together.
+[package]
+name = "app"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-python", version = "*" }
+
+[package.host-dependencies]
+hatchling = "*"
+
+[package.run-dependencies]
+greeter = { workspace = true }

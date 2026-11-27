@@ -53,18 +53,20 @@ impl SourceBuilder {
             .map(|(_, r)| r)
     }
 
-    /// Build the `sources` for `subdir` and return a record for each of them.
+    /// Build the `needed` source packages for `subdir` and return a record for each of them.
     ///
-    /// All of them are built together in one `pixi publish`, so source packages may depend on
-    /// each other at runtime. Nothing is built when earlier builds already provide every
-    /// package, e.g. for another image, and a noarch package built for an earlier platform is
-    /// reused, so all platforms install the same file.
+    /// `all` are the source packages of the environment, including those replaced by an
+    /// injected package. They are built together in one `pixi publish`, which refuses packages
+    /// whose source run dependencies it doesn't build as well. Nothing is built when earlier
+    /// builds already provide every needed package, e.g. for another image, and a noarch
+    /// package built for an earlier platform is reused, so all platforms install the same file.
     pub fn build(
         &mut self,
-        sources: &[SourcePackage],
+        all: &[SourcePackage],
+        needed: &[&SourcePackage],
         subdir: Subdir,
     ) -> Result<Vec<RepoDataRecord>> {
-        let earlier: Vec<Option<RepoDataRecord>> = sources
+        let earlier: Vec<Option<RepoDataRecord>> = needed
             .iter()
             .map(|source| self.earlier(source, subdir).cloned())
             .collect();
@@ -72,8 +74,8 @@ impl SourceBuilder {
             return Ok(records);
         }
 
-        let built = self.publish(sources, subdir)?;
-        let records = sources
+        let built = self.publish(all, subdir)?;
+        let records = needed
             .iter()
             .zip(earlier)
             .map(|(source, earlier)| match earlier {
@@ -118,11 +120,22 @@ impl SourceBuilder {
             .map(|p| p.name.as_source())
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!(
-            "🏗️  Building {names} for {} with pixi publish",
-            subdir.as_str()
-        );
-        run_pixi_publish(&manifests, subdir, &output)
+        // Noarch packages are the same for every platform, so build them for the host: their
+        // build and host environments then run here, without cross-compiling.
+        let build_subdir = match Subdir::current() {
+            Some(current) if sources.iter().all(|s| s.noarch) => {
+                eprintln!("🏗️  Building {names} (noarch) with pixi publish");
+                current
+            }
+            _ => {
+                eprintln!(
+                    "🏗️  Building {names} for {} with pixi publish",
+                    subdir.as_str()
+                );
+                subdir
+            }
+        };
+        run_pixi_publish(&manifests, build_subdir, &output)
             .with_context(|| format!("could not build source packages {names}"))?;
         let built = built_records(&output)?;
         for record in &built {
@@ -187,6 +200,9 @@ fn run_pixi_publish(manifests: &[PathBuf], subdir: Subdir, output: &Path) -> Res
         command.arg("--path").arg(manifest);
     }
     command
+        // Set by `pixi run` for the workspace pixi-oci runs in, not the one built here.
+        .env_remove("PIXI_PROJECT_MANIFEST")
+        .env_remove("PIXI_WORKSPACE_MANIFEST")
         // The image may be written to stdout, so pixi's output goes to stderr.
         .stdout(Stdio::from(std::io::stderr()))
         .stdin(Stdio::null());
@@ -242,9 +258,10 @@ mod tests {
         let sources = [SourcePackage {
             name: "myapp".parse().unwrap(),
             location: UrlOrPath::Url("git+https://example.com/myapp.git".parse().unwrap()),
+            noarch: true,
         }];
         let err = SourceBuilder::new(dir.path(), dir.path())
-            .build(&sources, Subdir::Linux64)
+            .build(&sources, &[&sources[0]], Subdir::Linux64)
             .unwrap_err();
         assert!(err.to_string().contains("--skip myapp"), "{err}");
     }
@@ -255,9 +272,10 @@ mod tests {
         let sources = [SourcePackage {
             name: "myapp".parse().unwrap(),
             location: UrlOrPath::Path("does-not-exist".into()),
+            noarch: true,
         }];
         let err = SourceBuilder::new(dir.path(), dir.path())
-            .build(&sources, Subdir::Linux64)
+            .build(&sources, &[&sources[0]], Subdir::Linux64)
             .unwrap_err();
         assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
     }

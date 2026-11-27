@@ -137,7 +137,7 @@ platforms = ["linux-64", "linux-aarch64"]
 myapp = { path = "." }
 ```
 
-Source packages are built once per platform, even when several images use them, and a noarch build serves all platforms. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`: an injected package replaces the source package of the same name, which is then not built. `--skip` leaves a source package out entirely.
+Source packages are built once per platform, even when several images use them, and a noarch build serves all platforms. When the lockfile marks every source package as noarch, they are built for the host platform, so their build tools run natively. An injected package replaces the source package of the same name in the image, but the source package is still built with the others, because `pixi publish` refuses packages whose source dependencies it doesn't build too. Only source packages in a local directory can be built; for packages from git or a URL, or to use an artifact you built yourself, pass `--inject`. `--skip` leaves a source package out entirely.
 
 Compiled packages are cross-compiled for the target platform, which `pixi publish` does not support on every host for every backend. If building for a linux platform fails on your machine, build on a linux host of that architecture, or build the package there and pass it with `--inject`.
 

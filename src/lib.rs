@@ -408,14 +408,19 @@ fn complete_environments(
             .map(|spec| spec.path.as_path())
             .collect();
         inject_packages(&mut l.records, &inject, l.subdir)?;
-        // An injected package replaces a source package of the same name, so it isn't built.
-        l.sources.retain(|source| {
-            !l.records
-                .iter()
-                .any(|r| r.package_record.name == source.name)
-        });
-        if !l.sources.is_empty() {
-            let built = source_builder.build(&l.sources, l.subdir)?;
+        // An injected package replaces a source package of the same name, whose build is not
+        // used.
+        let needed: Vec<_> = l
+            .sources
+            .iter()
+            .filter(|source| {
+                !l.records
+                    .iter()
+                    .any(|r| r.package_record.name == source.name)
+            })
+            .collect();
+        if !needed.is_empty() {
+            let built = source_builder.build(&l.sources, &needed, l.subdir)?;
             l.records.extend(built);
         }
         if !options.skip_validation {
