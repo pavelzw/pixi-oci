@@ -281,6 +281,25 @@ mod tests {
     }
 
     #[test]
+    fn reads_only_packages_from_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("packages");
+        std::fs::create_dir(&packages).unwrap();
+        crate::inject::tests::write_package(dir.path(), "greeter", "noarch", &[]);
+        std::fs::rename(
+            dir.path().join("greeter-1.0-0.tar.bz2"),
+            packages.join("greeter-1.0-0.tar.bz2"),
+        )
+        .unwrap();
+        // Neither a file that isn't a package nor a directory is read as a package.
+        std::fs::write(packages.join("build.log"), "done\n").unwrap();
+        std::fs::create_dir(packages.join("other-1.0-0.conda")).unwrap();
+        let records = built_records(&packages).unwrap();
+        let names: Vec<_> = records.iter().map(|r| r.identifier.to_string()).collect();
+        assert_eq!(names, ["greeter-1.0-0.tar.bz2"]);
+    }
+
+    #[test]
     fn quotes_command_lines() {
         let mut command = Command::new("pixi");
         command.args(["publish", "--path", "my dir"]);

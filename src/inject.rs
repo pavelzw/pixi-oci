@@ -151,7 +151,7 @@ pub fn validate_environment(records: &[RepoDataRecord]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use rattler_conda_types::{
@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     /// Write `<name>-1.0-0.tar.bz2` with a single file `share/<name>.txt` into `dir`.
-    fn write_package(dir: &Path, name: &str, subdir: &str, depends: &[&str]) -> PathBuf {
+    pub(crate) fn write_package(dir: &Path, name: &str, subdir: &str, depends: &[&str]) -> PathBuf {
         let contents = dir.join(format!("{name}-contents"));
         std::fs::create_dir_all(contents.join("info")).unwrap();
         std::fs::create_dir_all(contents.join("share")).unwrap();
