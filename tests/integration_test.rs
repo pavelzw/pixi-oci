@@ -843,3 +843,211 @@ async fn skopeo_can_inspect(tmpdir: tempfile::TempDir) {
     assert_eq!(json["Architecture"], "amd64");
     assert_eq!(json["Os"], "linux");
 }
+
+/// A password-protected `registry:2` container, removed on drop.
+struct LocalRegistry {
+    container: String,
+    host: String,
+}
+
+impl LocalRegistry {
+    const USERNAME: &str = "testuser";
+    const PASSWORD: &str = "testpassword";
+    /// `htpasswd -nbB testuser testpassword`
+    const HTPASSWD: &str = "testuser:$2y$05$9pHzQhR.ulyGSFroL43lNeCV3rnEpXDhuOUWppOV4uAS64Mfn2fe2";
+
+    async fn start(dir: &Path) -> Self {
+        let auth_dir = dir.join("registry-auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        fs::write(auth_dir.join("htpasswd"), format!("{}\n", Self::HTPASSWD)).unwrap();
+        let run = Command::new("docker")
+            .args(["run", "-d", "--rm", "-p", "127.0.0.1::5000", "-v"])
+            .arg(format!("{}:/auth:ro", auth_dir.display()))
+            .args([
+                "-e",
+                "REGISTRY_AUTH=htpasswd",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_REALM=test",
+                "-e",
+                "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+                "registry:2",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "starting the registry failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let container = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        let port = Command::new("docker")
+            .args(["port", &container, "5000/tcp"])
+            .output()
+            .unwrap();
+        let port = String::from_utf8_lossy(&port.stdout);
+        let port = port
+            .lines()
+            .next()
+            .and_then(|l| l.rsplit_once(':'))
+            .map(|(_, p)| p.trim().to_string())
+            .expect("registry port");
+        let registry = Self {
+            container,
+            host: format!("localhost:{port}"),
+        };
+        // Wait until the registry answers (with 401, as it requires credentials).
+        let client = reqwest::Client::new();
+        for _ in 0..60 {
+            if client
+                .get(format!("http://{}/v2/", registry.host))
+                .send()
+                .await
+                .is_ok_and(|r| r.status() == reqwest::StatusCode::UNAUTHORIZED)
+            {
+                return registry;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("the registry did not come up");
+    }
+
+    /// Push a tiny linux/amd64 image with a single file and return its layer digest.
+    async fn push_base_image(&self, reference: &str) -> String {
+        let mut layer_tar = tar::Builder::new(Vec::new());
+        let content = b"private base\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        layer_tar
+            .append_data(&mut header, "private-base.txt", &content[..])
+            .unwrap();
+        let layer_tar = layer_tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &layer_tar).unwrap();
+        let layer_gz = gz.finish().unwrap();
+        let config = serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": [format!("sha256:{}", sha256_hex(&layer_tar))]},
+        });
+
+        let client = oci_client::Client::new(oci_client::client::ClientConfig {
+            protocol: oci_client::client::ClientProtocol::Http,
+            ..Default::default()
+        });
+        client
+            .push(
+                &reference.parse().unwrap(),
+                &[oci_client::client::ImageLayer::new(
+                    layer_gz.clone(),
+                    oci_client::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(),
+                    None,
+                )],
+                oci_client::client::Config::new(
+                    serde_json::to_vec(&config).unwrap(),
+                    oci_client::manifest::IMAGE_CONFIG_MEDIA_TYPE.to_string(),
+                    None,
+                ),
+                &oci_client::secrets::RegistryAuth::Basic(
+                    Self::USERNAME.to_string(),
+                    Self::PASSWORD.to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("pushing the base image");
+        format!("sha256:{}", sha256_hex(&layer_gz))
+    }
+}
+
+impl Drop for LocalRegistry {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container])
+            .output();
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn pulls_private_base_image(tmpdir: tempfile::TempDir) {
+    let docker_running = Command::new("docker")
+        .arg("info")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !docker_running || std::env::var_os("PIXI_OCI_SKIP_DOCKER_TESTS").is_some() {
+        eprintln!("docker not available, skipping");
+        return;
+    }
+    let registry = LocalRegistry::start(tmpdir.path()).await;
+    let base = format!("{}/private/base:latest", registry.host);
+    let base_layer = registry.push_base_image(&base).await;
+    let project = example_with_base(tmpdir.path(), &base);
+
+    let build = |docker_config: &Path, out: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_pixi-oci"))
+            .args(["build", "--manifest-path"])
+            .arg(&project)
+            .args(["--platform", "linux-64", "--output"])
+            .arg(out)
+            .env("DOCKER_CONFIG", docker_config)
+            .env("XDG_CONFIG_HOME", tmpdir.path())
+            .env_remove("REGISTRY_AUTH_FILE")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("PIXI_OCI_REGISTRY_USERNAME")
+            .env_remove("PIXI_OCI_REGISTRY_PASSWORD")
+            .output()
+            .expect("pixi-oci runs")
+    };
+
+    // Without credentials, the pull is rejected and the error explains how to log in.
+    let anonymous_config = tmpdir.path().join("docker-anonymous");
+    fs::create_dir_all(&anonymous_config).unwrap();
+    let output = build(&anonymous_config, &tmpdir.path().join("anonymous.tar"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("docker login"), "{stderr}");
+
+    // With credentials from the docker config, the base layer ends up in the image.
+    let docker_config = tmpdir.path().join("docker");
+    fs::create_dir_all(&docker_config).unwrap();
+    let auth = format!("{}:{}", LocalRegistry::USERNAME, LocalRegistry::PASSWORD);
+    let auth = base64_encode(auth.as_bytes());
+    fs::write(
+        docker_config.join("config.json"),
+        serde_json::json!({"auths": {registry.host.clone(): {"auth": auth}}}).to_string(),
+    )
+    .unwrap();
+    let out = tmpdir.path().join("private.tar");
+    let output = build(&docker_config, &out);
+    assert!(
+        output.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest = Archive::open(&out).manifest();
+    assert_eq!(manifest.layers[0].digest, base_layer);
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
